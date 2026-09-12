@@ -1,0 +1,365 @@
+# ENGINEERING SPECIFICATION: 3.3V LOGIC & 5.0V INDUCTIVE POWER RAIL ISOLATION AND BROWNOUT DETECTOR (BOD) RESET MITIGATION
+
+---
+
+**Document Identifier:** AIOT-PWR-ISOL-BOD-2026-V1.0  
+**Project Title:** Adaptive Autonomous Plant Irrigation Node (ESP32-S3 + On-Device TinyML)  
+**Author / Subsystem:** Embedded Hardware & Power Electronics Specialist (Member A)  
+**Target Microcontroller:** Espressif ESP32-S3-WROOM-1 / ESP32-S3-DevKitC-1  
+**System Power Input:** Single Centralized 5.0V DC / 2.0A Rail via USB Type-C  
+**Target Inductive Load:** 5.0V Mini Diaphragm Liquid Pump Motor ($I_{\text{inrush}} \approx 750\text{ mA}$)  
+**Document Status:** Production Engineering Specification  
+
+---
+
+## 1. Executive Summary & Failure Physics Analysis
+
+### 1.1. The Brownout Detector (BOD) Problem Definition
+In embedded IoT systems where high-current inductive actuators (DC pumps, solenoids, valves) share a common primary power source with digital computation units, **dynamic impedance cross-coupling** represents the primary cause of spontaneous field resets.
+
+When the mini 5V DC pump turns on:
+1. **Inrush Current Surge:** The stationary motor rotor generates zero Counter-Electromotive Force (Back-EMF, $E_b = 0$). The low DC armature winding resistance ($R_a \approx 6.67\ \Omega$) causes an instantaneous current spike of $I_{\text{inrush}} \approx 750\text{ mA}$ with a transient duration of $\Delta t \approx 30 - 80\text{ ms}$.
+2. **Terminal Bus Voltage Droop:** The parasitic resistance of the interconnecting USB cable ($R_{\text{cable}} \approx 0.15 - 0.30\ \Omega$), front-end fuse, PCB traces, and finite power supply internal resistance form a dynamic voltage divider:
+   $$\Delta V_{\text{BUS}}(t) = I_{\text{load}}(t) \cdot R_{\text{interconnect}} + L_{\text{cable}} \frac{di_{\text{load}}(t)}{dt}$$
+   An unbuffered $750\text{ mA}$ step load can pull the raw 5.0V bus down below $4.0\text{V} - 3.2\text{V}$ for tens of milliseconds.
+3. **LDO Dropout Collapse:** The ESP32-S3 development board relies on an on-board Low-Dropout (LDO) regulator (e.g., SGM2211, AMS1117-3.3, or ME6211) to generate the regulated $3.30\text{V}$ logic supply. If the 5V bus droops below the dropout boundary ($V_{\text{BUS}} < V_{\text{OUT}} + V_{\text{dropout}} \approx 3.3\text{V} + 0.25\text{V} = 3.55\text{V}$), the LDO ceases regulation. The $3.3\text{V}$ logic rail collapses linearly with the collapsing input.
+4. **Hardware BOD Assertion:** The ESP32-S3 internal Brownout Detector (BOD) compares the internal $V_{DD}$ rail against a precision bandgap reference. When $V_{DD}$ falls below the configured hardware threshold ($V_{\text{BOD}} \approx 2.80\text{V}$ at Level 7), the comparator asserts a hard reset:
+   $$\text{Reset Cause: } \texttt{ESP_RST_BROWNOUT} \quad (\text{"Brownout detector was triggered"})$$
+   This causes memory corruption, reboot loops, and failure to irrigate.
+
+### 1.2. ESP32-S3 Internal BOD Architecture
+The ESP32-S3 integrates an analog low-voltage detection comparator tied directly to the core power domain:
+
+```
+                  ESP32-S3 Internal Core Power Domain
+                       +-------------------------+
+3.3V Logic Rail =======|======+                  |
+                       |      |                  |
+                       |   +--+---+              |
+                       |   | / -  |              |
+                       |   |/     |              |
+1.2V Bandgap Ref =====>|---| +    | Comparator   |
+                       |   |\     | Output       |
+                       |   | \    |---+          |
+                       |   +------+   |          |
+                       |      |       v          |
+                       |  [BOD Filter / Deglitch]|
+                       |      |       |          |
+                       |      v       v          |
+                       |  [ System Hard Reset ]  |
+                       |  (ESP_RST_BROWNOUT)     |
+                       +-------------------------+
+```
+
+* **Comparator Thresholds:** Programmable via eFuse or software registers across 8 discrete trigger levels ($V_{\text{BOD0}} \approx 2.43\text{V}$ up to $V_{\text{BOD7}} \approx 2.80\text{V}$).
+* **Deglitch Filter Window:** The internal analog filter requires the voltage dip to persist for more than $\approx 1.5 - 2.5\ \mu\text{s}$ before asserting reset, designed to reject sub-microsecond RF switching noise but fully responsive to millisecond-scale motor inrush droops.
+
+---
+
+## 2. Power Rail Isolation Topologies
+
+To guarantee zero brownout occurrences, the 5.0V actuator domain and the 3.3V MCU/sensor domain must be decoupled through hardware isolation. Two complementary topologies are engineered below.
+
+### 2.1. Topology A: Star-Routed LC Filter with High-Current Ferrite Isolation (Primary Architecture)
+This topology utilizes strict physical separation at the primary power entry, providing continuous bidirectional DC coupling while establishing an impenetrable impedance barrier against high-frequency motor noise and transient inrush sags.
+
+```
+                                  +5.0V USB-C Main Input
+                                            |
+                         +------------------+------------------+
+                         | (Star Point Post-PTC & TVS)         |
+                         |                                     |
+                         v Actuator Branch (Dirty 5V)          v Logic Branch (Clean 5V)
+               +-------------------+                 +-------------------+
+               | C_bulk: 1000uF    |                 | Ferrite Bead:     |
+               | Low-ESR Polymer   |                 | 600 Ohm @ 100MHz  |
+               +---------+---------+                 +---------+---------+
+                         |                                     |
+                         v                                     +---> C_logic: 22uF + 100nF
+               [ 5V Mini Pump Motor ]                          |
+                         |                                     v
+               [ Low-Side N-MOSFET ]                 [ ESP32-S3 On-board LDO ]
+                         |                           (VIN: 5.0V -> VOUT: 3.3V)
+                         v                                     |
+                     Power GND                                 v
+                         |                            [ 3.3V Clean Rail ]
+                         |                            - ESP32-S3 Dual Core
+                         |                            - AHT20 / BH1750 Sensors
+                         |                            - Capacitive Probe
+                         |                                     |
+                         |                                 Analog/Digital GND
+                         |                                     |
+                         +=================[ Star GND ]========+
+```
+
+* **Operating Principle:** The bulk capacitor $C_{\text{bulk}}$ ($1000\ \mu\text{F}$) on the actuator branch acts as a local charge reservoir, supplying $>85\%$ of the $750\text{ mA}$ inrush current locally. The ferrite bead ($\text{FB}_1$) acts as an open circuit to high-frequency transients, shielding the LDO input from voltage ripple and commutating RF spikes.
+
+---
+
+### 2.2. Topology B: Unidirectional Diode-Isolated "Energy Tank" (High-Headroom Hardened Architecture)
+For environments where the external 5V supply exhibits high impedance or long cabling ($> 1.5\text{ m}$), Topology B introduces a **unidirectional Schottky blocking diode** to completely decouple the logic reservoir from the actuator branch during transient sags.
+
+```
+                                   +5.0V Raw Input Rail
+                                             |
+                         +-------------------+-------------------+
+                         |                                       |
+                         v Actuator Rail (Dirty 5V)              v Logic Rail (Clean Isolation)
+               +-------------------+                   +-------------------+
+               | C_bulk: 1000uF    |                   | Schottky Diode    |
+               | Low-ESR Polymer   |                   | D_iso: SS34 (3A)  | (V_F approx 0.35V)
+               +---------+---------+                   +---------+---------+
+                         |                                       |
+                         v                                       +---> +4.65V Protected Logic Node
+               [ 5V Mini Pump Motor ]                            |
+                         |                             +---------+---------+
+               [ Low-Side N-MOSFET ]                   | C_hold: 470uF     | Logic Hold-Up
+                         |                             | Low-ESR Polymer   | Tank
+                         v                             +---------+---------+
+                     Power GND                                   |
+                         |                                       +---> C_bypass: 10uF + 100nF
+                         |                                       |
+                         |                                       v
+                         |                             [ ESP32-S3 On-Board LDO ]
+                         |                             (VIN: 4.65V -> VOUT: 3.3V)
+                         |                                       |
+                         |                                       v
+                         |                             [ 3.3V Logic Rail ]
+                         |                                       |
+                         +==================[ Star GND ]=========+
+```
+
+#### Analytical Breakdown of Topology B:
+1. **Steady-State Forward Operation:**
+   Current flows through Schottky barrier diode $D_{\text{iso}}$ into the logic reservoir capacitor $C_{\text{hold}}$. At nominal MCU draw ($I_{\text{logic}} \approx 80\text{ mA}$), the forward voltage drop across $D_{\text{iso}}$ is only $V_F \approx 0.32\text{ V}$.
+   $$V_{\text{LDO\_IN}} = V_{\text{BUS}} - V_F = 5.00\text{ V} - 0.32\text{ V} = 4.68\text{ V}$$
+   Since the integrated LDO requires $V_{\text{OUT}} + V_{\text{dropout}} = 3.30\text{ V} + 0.25\text{ V} = 3.55\text{ V}$, the system maintains a massive headroom of:
+   $$\text{Voltage Headroom} = 4.68\text{ V} - 3.55\text{ V} = \mathbf{1.13\text{ V}}$$
+2. **Dynamic Inrush & Sag Isolation:**
+   When the pump starts, if the external 5V bus collapses down to $3.5\text{V}$ or even $0.0\text{V}$, the anode of $D_{\text{iso}}$ drops below its cathode.
+   $D_{\text{iso}}$ becomes **instantaneously reverse-biased**, cutting off reverse conduction in $< 10\text{ ns}$.
+   The actuator **cannot draw a single microampere of charge** out of $C_{\text{hold}}$.
+3. **Autonomous Ride-Through Discharge:**
+   The logic subsystem operates purely from the stored charge in $C_{\text{hold}}$ until the external 5V bus recovers.
+
+---
+
+## 3. Mathematical Sizing of Decoupling & Hold-Up Components
+
+### 3.1. Sizing the Actuator Bulk Capacitor ($C_{\text{bulk}}$)
+The purpose of $C_{\text{bulk}}$ is to hold the raw 5V bus above $4.70\text{V}$ during the motor inrush acceleration phase ($\Delta t \approx 50\text{ ms}$).
+
+Let the maximum allowable bus droop be $\Delta V_{\text{droop}} = 0.30\text{ V}$.
+The equivalent source interconnect resistance is $R_s \approx 0.20\ \Omega$.
+Assuming the power supply regulator loop has an effective response time of $\Delta t_{\text{resp}} \approx 300\ \mu\text{s}$:
+$$C_{\text{bulk}} \ge \frac{I_{\text{inrush}} \cdot \Delta t_{\text{resp}}}{\Delta V_{\text{droop}}} = \frac{0.750\text{ A} \times 300\times 10^{-6}\text{ s}}{0.30\text{ V}} = 750\ \mu\text{F}$$
+
+To provide a 33% design safety margin against electrolytic capacitance tolerance ($\pm 20\%$) and temperature degradation:
+$$C_{\text{bulk\_selected}} = \mathbf{1000\ \mu\text{F} / 16\text{V} \quad (\text{Low-ESR Aluminum Polymer, ESR } \le 15\text{ m}\Omega)}$$
+
+* **ESR Voltage Drop Under Inrush:**
+  $$\Delta V_{\text{ESR}} = I_{\text{inrush}} \times R_{\text{ESR}} = 0.75\text{ A} \times 0.015\ \Omega = \mathbf{11.25\text{ mV}}$$
+* **Thermal Ripple Current Rating:**
+  The selected capacitor (e.g., Panasonic 16SEPC1000M) is rated for $I_{\text{ripple}} = 5400\text{ mA}_{\text{rms}}$, vastly exceeding the motor inrush requirement and ensuring infinite operational lifespan.
+
+---
+
+### 3.2. Sizing the Logic Hold-Up Capacitor ($C_{\text{hold}}$ - Topology B)
+If using Topology B, calculate the exact capacitance required to sustain the ESP32-S3 and all sensors through a total 5V bus blackout lasting $\Delta t_{\text{blackout}} = 50\text{ ms}$:
+
+* Average MCU + Sensor operating current during active processing: $I_{\text{logic\_avg}} \approx 85\text{ mA} = 0.085\text{ A}$.
+* Initial voltage on $C_{\text{hold}}$: $V_{\text{initial}} = 5.0\text{V} - 0.32\text{V} = 4.68\text{V}$.
+* Minimum allowable voltage before LDO drops below 3.3V regulation: $V_{\text{final}} = 3.30\text{V} + 0.25\text{V} = 3.55\text{V}$.
+* Allowable discharge voltage delta:
+  $$\Delta V_{\text{discharge}} = V_{\text{initial}} - V_{\text{final}} = 4.68\text{ V} - 3.55\text{ V} = 1.13\text{ V}$$
+
+Applying constant-current discharge equation:
+$$C_{\text{hold}} = \frac{I_{\text{logic\_avg}} \cdot \Delta t_{\text{blackout}}}{\Delta V_{\text{discharge}}} = \frac{0.085\text{ A} \times 0.050\text{ s}}{1.13\text{ V}} = 3.76\times 10^{-3}\text{ F} = 376\ \mu\text{F}$$
+
+Selecting standard E-series value with safety derating:
+$$C_{\text{hold\_selected}} = \mathbf{470\ \mu\text{F} / 10\text{V} \quad (\text{Polymer SMD / Low-ESR Radial, ESR } \le 25\text{ m}\Omega)}$$
+
+* **Autonomous Hold-Up Time Achieved:**
+  $$t_{\text{ride\_through}} = \frac{470\times 10^{-6}\text{ F} \times 1.13\text{ V}}{0.085\text{ A}} = 6.25\times 10^{-2}\text{ s} = \mathbf{62.5\text{ ms}}$$
+This guarantees over $62\text{ ms}$ of continuous, ripple-free operation even if the primary 5V line completely collapses to zero.
+
+---
+
+### 3.3. Pi-Filter / Ferrite Bead Selection (Topology A)
+For Topology A, high-frequency motor commutating noise must be attenuated before reaching the LDO input.
+
+```
+       5V Star Node ----[ Ferrite Bead FB1 ]----+----> To LDO VIN Pin
+                                             |
+                                            === C_filter (10uF MLCC + 100nF)
+                                             |
+                                            GND
+```
+
+* **Ferrite Bead Specification:** **BLM21PG601SN1D** (Murata, 0805 package).
+  - Impedance at 100 MHz: $Z = 600\ \Omega \pm 25\%$.
+  - DC Resistance ($R_{\text{DC}}$): $0.10\ \Omega$ maximum.
+  - Rated Current ($I_{\text{DC}}$): $1.50\text{ A}$ (operates at $< 10\%$ rated current; zero magnetic saturation risk).
+  - DC Voltage Drop across Bead: $\Delta V = 0.085\text{ A} \times 0.10\ \Omega = \mathbf{8.5\text{ mV}}$ (negligible).
+* **Cut-Off Frequency of Pi-Filter:**
+  Formed by the parasitic inductance of the bead ($L_{\text{eff}} \approx 1.2\ \mu\text{H}$) and downstream MLCC capacitor ($C = 10\ \mu\text{F}$):
+  $$f_c = \frac{1}{2\pi \sqrt{L_{\text{eff}} \cdot C}} = \frac{1}{2\pi \sqrt{1.2\times 10^{-6} \times 10\times 10^{-6}}} \approx \mathbf{45.9\text{ kHz}}$$
+All high-frequency harmonics of the $10\text{ kHz}$ motor PWM and brush commutation spikes ($> 1\text{ MHz}$) are attenuated by $> 35\text{ dB}$.
+
+---
+
+## 4. Inductive Actuator Transient Suppression Subsystem
+
+The motor switching interface incorporates a dedicated three-tier suppression network to eliminate inductive kickback ($V = -L \frac{di}{dt}$) and commutating RF emissions.
+
+```
+                                +5V Actuator Rail
+                                        |
+                                        +-------------------+
+                                        |                   |
+                                     +-----+             +-----+
+                                     |     |             |     |
+                                     | R385|      1N5819 | RC  | (10 Ohm + 100nF)
+                                     | Pump|     Schottky|     |
+                                     |     |             |     |
+                                     +-----+             +-----+
+                                        |                   |
+                                        +---------+---------+
+                                                  |
+                                                Drain
+                                                  |
+GPIO 6 (PWM) ---[ 100 Ohm ]----+----> Gate        |
+                               |      [ AO3400A N-MOS ]
+                         [ 10k Ohm ]              |
+                               |                Source
+                              GND                 |
+                                              Power GND
+```
+
+### 4.1. Fast Freewheeling Schottky Diode
+* **Component:** **1N5819HW-7-F** (SOD-123FL) or **SS14** (SMA).
+* **Reverse Breakdown Voltage:** $V_{\text{RRM}} = 40\text{ V}$.
+* **Forward Current:** $I_{F(\text{AV})} = 1.0\text{ A}$ continuous.
+* **Forward Conduction Drop:** $V_F \le 0.45\text{ V}$ at $1.0\text{ A}$.
+* **Reverse Recovery Time ($t_{rr}$):** Ultra-fast ($< 10\text{ ns}$). Eliminates reverse inductive spikes across the MOSFET drain during PWM turn-off.
+
+### 4.2. High-Frequency RC Snubber Circuit
+* **Resistor:** $10\ \Omega \pm 1\%$, 0.5W carbon film or 1206 thick film SMD.
+* **Capacitor:** $100\text{ nF} / 100\text{V}$, X7R ceramic capacitor.
+* **Function:** Damps high-frequency ringing caused by motor winding leakage inductance and rotor brush bounce, preventing high-frequency interference from radiating into sensor I2C communication leads.
+
+### 4.3. MOSFET Switching Characteristics
+* **Component:** **AO3400A** (Alpha & Omega, SOT-23) or **LR7843** (Infineon, TO-252).
+* **Gate Threshold:** $V_{\text{GS(th)}} = 0.65\text{V} - 1.45\text{V}$ (fully saturated at 3.3V logic level).
+* **On-Resistance:** $R_{\text{DS(on)}} \le 22\text{ m}\Omega$ at $V_{\text{GS}} = 2.5\text{V}$.
+* **Inrush Conduction Loss:**
+  $$P_{\text{loss\_inrush}} = (0.75\text{ A})^2 \times 0.022\ \Omega = \mathbf{12.4\text{ mW}} \quad (\text{Zero heatsink required})$$
+
+---
+
+## 5. ESP32-S3 Firmware Brownout Detector (BOD) Calibration & Handling
+
+To complement hardware isolation, firmware must configure the ESP32-S3 internal Brownout Detector appropriately in the ESP-IDF framework.
+
+### 5.1. ESP-IDF `sdkconfig` Parameters
+The default ESP-IDF configuration enables BOD at the highest sensitivity (Level 7 $\approx 2.80\text{V}$). In battery or USB installations, short microsecond dips during Wi-Fi transmission bursts can trigger false positives if the threshold is set excessively high.
+
+Recommended project `sdkconfig` settings:
+
+```ini
+#
+# Hardware System Configuration / Brownout Detector
+#
+CONFIG_ESP_BROWNOUT_DET=y
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_7=n
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_6=n
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_5=n
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_4=n
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_3=n
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_2=n
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_1=n
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_0=y
+CONFIG_ESP_BROWNOUT_DET_LVL=0
+```
+
+* **Rationale for Level 0 ($2.43\text{V}$):**
+  The ESP32-S3 core and Flash/PSRAM operate reliably down to $V_{DD} = 2.70\text{V}$ (typical minimum operating voltage: $3.0\text{V} - 3.6\text{V}$).
+  Setting BOD to **Level 0 ($2.43\text{V}$)** widens the operating noise margin by **$370\text{ mV}$**, preventing spurious triggers during concurrent motor inrush and Wi-Fi PA bursts, while still providing robust latch-up protection well above the minimum core retention voltage ($2.30\text{V}$).
+
+### 5.2. Early Warning & Safe State Interrupt Implementation
+For high-reliability deployments, firmware can intercept a preliminary voltage droop interrupt before the hard reset fires, allowing the MCU to cut off the motor immediately:
+
+```c
+/**
+ * @file power_supervisor.c
+ * @brief Power Supervisory & BOD Monitoring Routine
+ */
+
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_system.h"
+#include "hal/brownout_hal.h"
+#include "soc/rtc_cntl_reg.h"
+#include "driver/ledc.h"
+
+#define PUMP_LEDC_CHANNEL   LEDC_CHANNEL_0
+#define PUMP_LEDC_MODE      LEDC_LOW_SPEED_MODE
+
+static const char *TAG = "PWR_SUPV";
+
+/**
+ * @brief Check reset reason on boot
+ */
+void check_boot_power_status(void) {
+    esp_reset_reason_t reason = esp_reset_reason();
+    if (reason == ESP_RST_BROWNOUT) {
+        ESP_LOGE(TAG, "CRITICAL: System restarted due to BROWNOUT DETECTOR trigger!");
+        ESP_LOGE(TAG, "Inspect 5V input cable impedance, bulk capacitor, and motor snubber.");
+    } else {
+        ESP_LOGI(TAG, "System booted cleanly. Reset reason code: %d", reason);
+    }
+}
+
+/**
+ * @brief Emergency hardware cutoff hook called if voltage degrades
+ */
+void IRAM_ATTR emergency_power_cutoff(void) {
+    // Force immediate PWM termination to relieve bus loading
+    ledc_set_duty(PUMP_LEDC_MODE, PUMP_LEDC_CHANNEL, 0);
+    ledc_update_duty(PUMP_LEDC_MODE, PUMP_LEDC_CHANNEL);
+}
+```
+
+---
+
+## 6. Verification & Oscilloscope Measurement Protocol
+
+To certify compliance with this engineering specification, the assembled system must be validated on an oscilloscope using the following standardized test matrix:
+
+```
++------------------------------------------------------------------------------------------------+
+|                             OSCILLOSCOPE VALIDATION MATRIX                                     |
++---------+--------------------+------------------------------------+----------------------------+
+| Test ID | Test Condition     | Measurement Points                 | Pass / Fail Criteria       |
++---------+--------------------+------------------------------------+----------------------------+
+| TEST-V1 | Motor Step Start   | CH1: 5V Actuator Rail              | CH1 Sag <= 250 mV          |
+|         | (100% PWM Step,    | CH2: LDO Input (VIN Pin)           | CH2 Sag <= 100 mV          |
+|         | No Soft-Start)     | CH3: 3.3V Logic Rail               | CH3 Sag <= 30 mV           |
+|         |                    | Trigger: GPIO 6 Rising Edge        | Zero BOD trigger           |
++---------+--------------------+------------------------------------+----------------------------+
+| TEST-V2 | Worst-Case Peak:   | CH1: 5V USB Input Bus              | 5V Bus >= 4.75 V           |
+|         | Motor Inrush +     | CH2: 3.3V Logic Rail               | 3.3V Logic >= 3.25 V       |
+|         | Wi-Fi 802.11b TX   | CH3: Current Probe on Motor (+)    | Peak Inrush <= 780 mA      |
+|         | Burst Concurrent   | Trigger: Motor start during Wi-Fi  | No core reboot             |
++---------+--------------------+------------------------------------+----------------------------+
+| TEST-V3 | PWM Turn-Off Edge  | CH1: MOSFET Drain Node             | Peak Flyback <= 6.5 V      |
+|         | (10 kHz Switching) | CH2: I2C SCL Bus Line              | I2C Noise <= 50 mV p-p     |
+|         |                    | Timebase: 500 ns / div             | Zero I2C bus lockups       |
++---------+--------------------+------------------------------------+----------------------------+
+| TEST-V4 | Ride-Through Test  | CH1: 5V Raw Bus (Simulate 30ms cut)| 3.3V Logic maintains       |
+|         | (Topology B Only)  | CH2: 3.3V Logic Rail               | continuous regulation      |
+|         |                    | Trigger: 5V Falling Edge           | for >= 50 ms               |
++---------+--------------------+------------------------------------+----------------------------+
+```
+
+---
