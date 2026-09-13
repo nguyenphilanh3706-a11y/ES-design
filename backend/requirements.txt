@@ -1,4 +1,0 @@
-fastapi
-uvicorn
-paho-mqtt
-psycopg2-binary
