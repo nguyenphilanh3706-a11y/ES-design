@@ -1,14 +1,34 @@
 import threading
 import paho.mqtt.client as mqtt
 import psycopg2
-import requests  # <-- THÊM THƯ VIỆN NÀY ĐỂ GỌI DISCORD
+import requests
+import json
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware  # <-- THƯ VIỆN CORS
 from pydantic import BaseModel
 
 app = FastAPI()
 
-# Khai báo MQTT Client ở mức toàn cục để các API có thể dùng nó gửi lệnh (Publish)
-mqtt_client = mqtt.Client()
+# ===== BỔ SUNG CẤU HÌNH CORS NÀY VÀO main.py =====
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Cho phép tất cả các nguồn gọi API vào
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ==========================================
+# CẤU HÌNH HIVEMQ CLOUD (THAY CHO LOCAL)
+# ==========================================
+BROKER_CLOUD = "491d98aeee1043adad1fd8414b04c1e5.s1.eu.hivemq.cloud"
+PORT_CLOUD = 8883
+
+mqtt_client = mqtt.Client(client_id="fastapi_backend_cloud")
+mqtt_client.tls_set()  # Bật bảo mật TLS cho cổng 8883
+
+# ĐÃ ĐIỀN TÀI KHOẢN HIVEMQ CLOUD CHÍNH CHỦ CỦA BẠN VÀO ĐÂY:
+mqtt_client.username_pw_set("esp_iot", "ESPIOT@123")
 
 # ==========================================
 # CẤU HÌNH WEBHOOK DISCORD
@@ -26,85 +46,106 @@ def send_discord_alert(message: str):
         print(f"Lỗi gửi Discord: {e}")
 
 # ==========================================
-# CẤU HÌNH DATABASE
+# CẤU HÌNH DATABASE (CLOUD AIVEN)
 # ==========================================
-DB_HOST = "127.0.0.1"
-DB_PORT = "5432"
-DB_NAME = "nlant_iot"
-DB_USER = "postgres"
-DB_PASSWORD = "password123"
+DATABASE_URL = "postgresql://avnadmin:AVNS_4NVhjrkWUR3w2RyW836@pg-2c8553bc-lecongquoca-1be9.l.aivencloud.com:21438/defaultdb?sslmode=require"
 
 def get_db_connection():
-    return psycopg2.connect(
-        host=DB_HOST,
-        database=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        port=DB_PORT,
-    )
+    # Sử dụng chuỗi kết nối trực tiếp đến Aiven Cloud
+    return psycopg2.connect(DATABASE_URL)
 
-# Khởi tạo bảng lưu dữ liệu cảm biến nếu chưa có
+# Khởi tạo bảng lưu dữ liệu cảm biến đầy đủ cột
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
+    
+    # 1. Xóa bảng cũ bị thiếu cột (nếu có) để làm mới
+    cur.execute("DROP TABLE IF EXISTS sensor_data CASCADE;")
+    
+    # 2. Tạo lại bảng mới với đầy đủ 7 cột
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS sensor_data (
+        CREATE TABLE sensor_data (
             time TIMESTAMPTZ NOT NULL,
             device_id VARCHAR(50),
             temperature FLOAT,
-            humidity FLOAT
+            humidity FLOAT,
+            soil_moisture FLOAT,
+            light FLOAT,
+            vpd FLOAT
         );
     """)
-    cur.execute("""
-        SELECT create_hypertable('sensor_data', 'time', if_not_exists => TRUE);
-    """)
+    # Bỏ create_hypertable vì Aiven bản Free có thể không cài sẵn extension TimescaleDB, 
+    # dùng PostgreSQL chuẩn vẫn dư sức chạy đồ án mượt mà.
     conn.commit()
     cur.close()
     conn.close()
 
 init_db()
 
-# Xử lý khi nhận được message từ MQTT Broker
+# BÁO CÁO TRẠNG THÁI KẾT NỐI (MỚI THÊM)
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        print("✅ Backend đã KẾT NỐI THÀNH CÔNG với HiveMQ Cloud!")
+        client.subscribe("plant/sensor/data")
+    else:
+        print(f"❌ LỖI KẾT NỐI HiveMQ! Mã lỗi (rc): {rc}")
+
+# Xử lý khi nhận được message từ MQTT Cloud Broker
 def on_message(client, userdata, msg):
     payload = msg.payload.decode("utf-8")
     print(f"Nhận dữ liệu từ topic {msg.topic}: {payload}")
     try:
-        parts = payload.split(",")
-        device_id = parts[0]
-        temp = float(parts[1])
-        hum = float(parts[2])
+        if payload.startswith("{"):
+            data = json.loads(payload)
+            device_id = data.get("device_id", "device_01")
+            temp = float(data.get("temperature", 30.0))
+            hum = float(data.get("humidity", 70.0))
+            soil_moisture = float(data.get("soilMoisture", hum))
+            light = float(data.get("light", 12000.0))
+            vpd = float(data.get("vpd", 1.2))
+        else:
+            parts = payload.split(",")
+            device_id = parts[0]
+            temp = float(parts[1])
+            hum = float(parts[2])
+            soil_moisture = hum
+            light = 12000.0
+            vpd = 1.2
 
-        # 1. Lưu vào Database
+        # 1. Lưu vào Database Aiven
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO sensor_data (time, device_id, temperature, humidity) VALUES (NOW(), %s, %s, %s)",
-            (device_id, temp, hum),
+            "INSERT INTO sensor_data (time, device_id, temperature, humidity, soil_moisture, light, vpd) VALUES (NOW(), %s, %s, %s, %s, %s, %s)",
+            (device_id, temp, hum, soil_moisture, light, vpd),
         )
         conn.commit()
         cur.close()
         conn.close()
-        print("-> Đã lưu vào TimescaleDB thành công!")
+        print("-> Đã lưu vào Aiven Database thành công!")
 
         # 2. KIỂM TRA ĐỘ ẨM VÀ BẮN CẢNH BÁO DISCORD
-        if hum < 20.0:
-            alert_msg = f"🚨 **CẢNH BÁO IoT:** Độ ẩm đất tại trạm `{device_id}` đang ở mức nguy hiểm ({hum}%). Hệ thống AI đề xuất bật máy bơm ngay!"
+        if hum < 30.0:
+            alert_msg = f"🚨 **CẢNH BÁO IoT:** Độ ẩm tại trạm `{device_id}` đang ở mức nguy hiểm ({hum}%). Hệ thống AI đề xuất bật máy bơm ngay!"
             send_discord_alert(alert_msg)
 
     except Exception as e:
         print(f"Lỗi xử lý dữ liệu: {e}")
 
-# Cấu hình MQTT Subscriber chạy ngầm
+# Cấu hình MQTT Subscriber chạy ngầm kết nối Cloud (ĐÃ CẬP NHẬT)
 def start_mqtt():
+    mqtt_client.on_connect = on_connect
     mqtt_client.on_message = on_message
-    mqtt_client.connect("localhost", 1883, 60)
-    mqtt_client.subscribe("sensor/data")
-    mqtt_client.loop_start()
+    try:
+        mqtt_client.connect(BROKER_CLOUD, PORT_CLOUD, 60)
+        mqtt_client.loop_start()
+    except Exception as e:
+        print(f"Lỗi khởi động ngầm MQTT: {e}")
 
 @app.on_event("startup")
 def startup_event():
     threading.Thread(target=start_mqtt, daemon=True).start()
-    print("MQTT Client background service started.")
+    print("MQTT Cloud Client background service started.")
 
 # ==========================================
 # KHAI BÁO MODEL DỮ LIỆU CHO API POST
@@ -117,21 +158,21 @@ class SystemConfig(BaseModel):
     hum_threshold: float
 
 # ==========================================
-# CÁC ENDPOINT API THEO CHECKLIST ĐỒ ÁN
+# CÁC ENDPOINT API ĐẦY ĐỦ
 # ==========================================
 
 @app.get("/")
 def read_root():
-    return {"message": "IoT Backend Server is running!"}
+    return {"message": "IoT Backend Cloud Server is running!"}
 
-# 1. Lấy thông số môi trường mới nhất
+# 1. Lấy thông số môi trường mới nhất (Đảm bảo dùng ORDER BY time DESC LIMIT 1)
 @app.get("/api/telemetry/latest")
 def get_latest_telemetry():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
-            "SELECT time, device_id, temperature, humidity FROM sensor_data ORDER BY time DESC LIMIT 1"
+            "SELECT time, device_id, temperature, humidity, soil_moisture, light, vpd FROM sensor_data ORDER BY time DESC LIMIT 1"
         )
         row = cur.fetchone()
         cur.close()
@@ -140,7 +181,15 @@ def get_latest_telemetry():
         if row:
             return {
                 "status": "success", 
-                "data": {"time": row[0], "device_id": row[1], "temperature": row[2], "humidity": row[3]}
+                "data": {
+                    "time": row[0], 
+                    "device_id": row[1], 
+                    "temperature": row[2], 
+                    "humidity": row[3],
+                    "soilMoisture": row[4],
+                    "light": row[5],
+                    "vpd": row[6]
+                }
             }
         return {"status": "success", "data": None, "message": "Chưa có dữ liệu cảm biến"}
     except Exception as e:
@@ -152,14 +201,21 @@ def get_telemetry_history(hours: int = 24):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        # Lấy dữ liệu trong vòng N giờ qua
-        query = f"SELECT time, device_id, temperature, humidity FROM sensor_data WHERE time >= NOW() - INTERVAL '{hours} hours' ORDER BY time DESC"
+        query = f"SELECT time, device_id, temperature, humidity, soil_moisture, light, vpd FROM sensor_data WHERE time >= NOW() - INTERVAL '{hours} hours' ORDER BY time DESC"
         cur.execute(query)
         rows = cur.fetchall()
         cur.close()
         conn.close()
 
-        result = [{"time": r[0], "device_id": r[1], "temperature": r[2], "humidity": r[3]} for r in rows]
+        result = [{
+            "time": r[0], 
+            "device_id": r[1], 
+            "temperature": r[2], 
+            "humidity": r[3],
+            "soilMoisture": r[4],
+            "light": r[5],
+            "vpd": r[6]
+        } for r in rows]
         return {"status": "success", "count": len(result), "data": result}
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -170,16 +226,14 @@ def control_pump(cmd: PumpCommand):
     if cmd.state not in ["ON", "OFF"]:
         return {"status": "error", "message": "Lệnh không hợp lệ. Chỉ chấp nhận 'ON' hoặc 'OFF'"}
     
-    # Bắn tin nhắn xuống MQTT Broker với topic cmd/pump
-    mqtt_client.publish("cmd/pump", cmd.state)
-    return {"status": "success", "message": f"Đã gửi lệnh {cmd.state} tới máy bơm!"}
+    mqtt_client.publish("plant/control/pump", cmd.state)
+    return {"status": "success", "message": f"Đã gửi lệnh {cmd.state} tới máy bơm qua Cloud!"}
 
 # 4. Cấu hình hệ thống
 @app.post("/api/config")
 def update_config(config: SystemConfig):
-    # Gửi cấu hình xuống ESP32 qua MQTT
     payload = f"{config.temp_threshold},{config.hum_threshold}"
-    mqtt_client.publish("cmd/config", payload)
+    mqtt_client.publish("plant/control/config", payload)
     
     return {
         "status": "success", 
@@ -187,8 +241,8 @@ def update_config(config: SystemConfig):
         "new_config": config.dict()
     }
 
-# 5. API ĐỂ BẠN TEST NHANH DISCORD TRÊN TRÌNH DUYỆT
+# 5. API TEST NHANH DISCORD
 @app.post("/api/test-discord")
 def test_discord():
-    send_discord_alert("**Test Bot:** Nếu bạn thấy tin nhắn này, hệ thống Backend đã gửi thành công dữ liệu lên Discord!")
-    return {"status": "success", "message": "Đã gửi test lên Discord, bạn mở app lên xem nhé!"}
+    send_discord_alert("**Test Bot:** Hệ thống Backend Cloud đã kết nối và gửi tin nhắn thành công lên Discord!")
+    return {"status": "success", "message": "Đã gửi test lên Discord!"}
