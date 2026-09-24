@@ -4,30 +4,28 @@ import psycopg2
 import requests
 import json
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware  # <-- THƯ VIỆN CORS
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 app = FastAPI()
 
-# ===== BỔ SUNG CẤU HÌNH CORS NÀY VÀO main.py =====
+# ===== CẤU HÌNH CORS =====
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Cho phép tất cả các nguồn gọi API vào
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ==========================================
-# CẤU HÌNH HIVEMQ CLOUD (THAY CHO LOCAL)
+# CẤU HÌNH HIVEMQ CLOUD
 # ==========================================
 BROKER_CLOUD = "491d98aeee1043adad1fd8414b04c1e5.s1.eu.hivemq.cloud"
 PORT_CLOUD = 8883
 
 mqtt_client = mqtt.Client(client_id="fastapi_backend_cloud")
-mqtt_client.tls_set()  # Bật bảo mật TLS cho cổng 8883
-
-# ĐÃ ĐIỀN TÀI KHOẢN HIVEMQ CLOUD CHÍNH CHỦ CỦA BẠN VÀO ĐÂY:
+mqtt_client.tls_set()
 mqtt_client.username_pw_set("esp_iot", "ESPIOT@123")
 
 # ==========================================
@@ -46,22 +44,17 @@ def send_discord_alert(message: str):
         print(f"Lỗi gửi Discord: {e}")
 
 # ==========================================
-# CẤU HÌNH DATABASE (CLOUD AIVEN)
+# CẤU HÌNH DATABASE CLOUD AIVEN (ĐÃ ĐƯỢC CHUẨN HÓA 100%)
 # ==========================================
-DATABASE_URL = "postgresql://avnadmin:AVNS_4NVhjrkWUR3w2RyW836@pg-2c8553bc-lecongquoca-1be9.l.aivencloud.com:21438/defaultdb?sslmode=require"
+DATABASE_URL = "postgres://avnadmin:AVNS_4NVhjrkWUR3w2RyW836@pg-2c8553bc-lecongquoca-1be9.l.aivencloud.com:21438/defaultdb?sslmode=require"
 
 def get_db_connection():
-    # Sử dụng chuỗi kết nối trực tiếp đến Aiven Cloud
     return psycopg2.connect(DATABASE_URL)
 
-# Khởi tạo bảng lưu dữ liệu cảm biến đầy đủ cột (PHIÊN BẢN AN TOÀN TRÊN CLOUD)
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
-    
-    # Đã xóa dòng DROP TABLE để bảo vệ dữ liệu khi Render khởi động lại máy chủ
-    
-    # 2. Tạo lại bảng mới với đầy đủ 7 cột (Thêm IF NOT EXISTS để tránh lỗi)
+    # Tạo bảng nếu chưa có, an toàn cho dữ liệu
     cur.execute("""
         CREATE TABLE IF NOT EXISTS sensor_data (
             time TIMESTAMPTZ NOT NULL,
@@ -79,7 +72,6 @@ def init_db():
 
 init_db()
 
-# BÁO CÁO TRẠNG THÁI KẾT NỐI
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
         print("✅ Backend đã KẾT NỐI THÀNH CÔNG với HiveMQ Cloud!")
@@ -87,7 +79,6 @@ def on_connect(client, userdata, flags, rc):
     else:
         print(f"❌ LỖI KẾT NỐI HiveMQ! Mã lỗi (rc): {rc}")
 
-# Xử lý khi nhận được message từ MQTT Cloud Broker
 def on_message(client, userdata, msg):
     payload = msg.payload.decode("utf-8")
     print(f"Nhận dữ liệu từ topic {msg.topic}: {payload}")
@@ -109,7 +100,6 @@ def on_message(client, userdata, msg):
             light = 12000.0
             vpd = 1.2
 
-        # 1. Lưu vào Database Aiven
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
@@ -121,7 +111,6 @@ def on_message(client, userdata, msg):
         conn.close()
         print("-> Đã lưu vào Aiven Database thành công!")
 
-        # 2. KIỂM TRA ĐỘ ẨM VÀ BẮN CẢNH BÁO DISCORD
         if hum < 30.0:
             alert_msg = f"🚨 **CẢNH BÁO IoT:** Độ ẩm tại trạm `{device_id}` đang ở mức nguy hiểm ({hum}%). Hệ thống AI đề xuất bật máy bơm ngay!"
             send_discord_alert(alert_msg)
@@ -129,7 +118,6 @@ def on_message(client, userdata, msg):
     except Exception as e:
         print(f"Lỗi xử lý dữ liệu: {e}")
 
-# Cấu hình MQTT Subscriber chạy ngầm kết nối Cloud
 def start_mqtt():
     mqtt_client.on_connect = on_connect
     mqtt_client.on_message = on_message
@@ -144,25 +132,17 @@ def startup_event():
     threading.Thread(target=start_mqtt, daemon=True).start()
     print("MQTT Cloud Client background service started.")
 
-# ==========================================
-# KHAI BÁO MODEL DỮ LIỆU CHO API POST
-# ==========================================
 class PumpCommand(BaseModel):
-    state: str  # Gửi "ON" hoặc "OFF"
+    state: str 
 
 class SystemConfig(BaseModel):
     temp_threshold: float
     hum_threshold: float
 
-# ==========================================
-# CÁC ENDPOINT API ĐẦY ĐỦ
-# ==========================================
-
 @app.get("/")
 def read_root():
     return {"message": "IoT Backend Cloud Server is running!"}
 
-# 1. Lấy thông số môi trường mới nhất (Đảm bảo dùng ORDER BY time DESC LIMIT 1)
 @app.get("/api/telemetry/latest")
 def get_latest_telemetry():
     try:
@@ -192,7 +172,6 @@ def get_latest_telemetry():
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-# 2. Lấy dữ liệu lịch sử
 @app.get("/api/telemetry/history")
 def get_telemetry_history(hours: int = 24):
     try:
@@ -217,7 +196,6 @@ def get_telemetry_history(hours: int = 24):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-# 3. Gửi lệnh điều khiển bơm
 @app.post("/api/control/pump")
 def control_pump(cmd: PumpCommand):
     if cmd.state not in ["ON", "OFF"]:
@@ -226,7 +204,6 @@ def control_pump(cmd: PumpCommand):
     mqtt_client.publish("plant/control/pump", cmd.state)
     return {"status": "success", "message": f"Đã gửi lệnh {cmd.state} tới máy bơm qua Cloud!"}
 
-# 4. Cấu hình hệ thống
 @app.post("/api/config")
 def update_config(config: SystemConfig):
     payload = f"{config.temp_threshold},{config.hum_threshold}"
@@ -238,7 +215,6 @@ def update_config(config: SystemConfig):
         "new_config": config.dict()
     }
 
-# 5. API TEST NHANH DISCORD
 @app.post("/api/test-discord")
 def test_discord():
     send_discord_alert("**Test Bot:** Hệ thống Backend Cloud đã kết nối và gửi tin nhắn thành công lên Discord!")
