@@ -44,9 +44,9 @@ def send_discord_alert(message: str):
         print(f"Lỗi gửi Discord: {e}")
 
 # ==========================================
-# CẤU HÌNH DATABASE CLOUD AIVEN (ĐÃ ĐƯỢC CHUẨN HÓA 100%)
+# CẤU HÌNH DATABASE CLOUD AIVEN (MẬT KHẨU MỚI NHẤT)
 # ==========================================
-DATABASE_URL = "postgres://avnadmin:AVNS_4NVhjrkWUR3w2RyW836@pg-2c8553bc-lecongquoca-1be9.l.aivencloud.com:21438/defaultdb?sslmode=require"
+DATABASE_URL = "postgres://avnadmin:AVNS_sYFmwz3jJRHYjaQjpcv@pg-2c8553bc-lecongquoca-1be9.l.aivencloud.com:21438/defaultdb?sslmode=require"
 
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
@@ -54,7 +54,6 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
-    # Tạo bảng nếu chưa có, an toàn cho dữ liệu
     cur.execute("""
         CREATE TABLE IF NOT EXISTS sensor_data (
             time TIMESTAMPTZ NOT NULL,
