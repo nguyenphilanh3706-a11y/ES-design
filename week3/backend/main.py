@@ -54,17 +54,16 @@ def get_db_connection():
     # Sử dụng chuỗi kết nối trực tiếp đến Aiven Cloud
     return psycopg2.connect(DATABASE_URL)
 
-# Khởi tạo bảng lưu dữ liệu cảm biến đầy đủ cột
+# Khởi tạo bảng lưu dữ liệu cảm biến đầy đủ cột (PHIÊN BẢN AN TOÀN TRÊN CLOUD)
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
     
-    # 1. Xóa bảng cũ bị thiếu cột (nếu có) để làm mới
-    cur.execute("DROP TABLE IF EXISTS sensor_data CASCADE;")
+    # Đã xóa dòng DROP TABLE để bảo vệ dữ liệu khi Render khởi động lại máy chủ
     
-    # 2. Tạo lại bảng mới với đầy đủ 7 cột
+    # 2. Tạo lại bảng mới với đầy đủ 7 cột (Thêm IF NOT EXISTS để tránh lỗi)
     cur.execute("""
-        CREATE TABLE sensor_data (
+        CREATE TABLE IF NOT EXISTS sensor_data (
             time TIMESTAMPTZ NOT NULL,
             device_id VARCHAR(50),
             temperature FLOAT,
@@ -74,15 +73,13 @@ def init_db():
             vpd FLOAT
         );
     """)
-    # Bỏ create_hypertable vì Aiven bản Free có thể không cài sẵn extension TimescaleDB, 
-    # dùng PostgreSQL chuẩn vẫn dư sức chạy đồ án mượt mà.
     conn.commit()
     cur.close()
     conn.close()
 
 init_db()
 
-# BÁO CÁO TRẠNG THÁI KẾT NỐI (MỚI THÊM)
+# BÁO CÁO TRẠNG THÁI KẾT NỐI
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
         print("✅ Backend đã KẾT NỐI THÀNH CÔNG với HiveMQ Cloud!")
@@ -132,7 +129,7 @@ def on_message(client, userdata, msg):
     except Exception as e:
         print(f"Lỗi xử lý dữ liệu: {e}")
 
-# Cấu hình MQTT Subscriber chạy ngầm kết nối Cloud (ĐÃ CẬP NHẬT)
+# Cấu hình MQTT Subscriber chạy ngầm kết nối Cloud
 def start_mqtt():
     mqtt_client.on_connect = on_connect
     mqtt_client.on_message = on_message
