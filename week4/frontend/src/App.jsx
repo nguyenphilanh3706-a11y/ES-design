@@ -33,7 +33,6 @@ export default function App() {
   const [mode, setMode] = useState('AUTO');
   const [isPumping, setIsPumping] = useState(false);
 
-  // Trạng thái dữ liệu cho Biểu đồ Chart.js
   const [chartData, setChartData] = useState({
     labels: [],
     datasets: [
@@ -56,11 +55,11 @@ export default function App() {
     ],
   });
 
-  // Lấy dữ liệu trực tiếp từ Backend thông qua đường hầm Ngrok
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const response = await fetch('https://region-twisted-overkill.ngrok-free.dev/api/telemetry/latest');
+        // ĐÃ CẬP NHẬT LINK CLOUD RENDER
+        const response = await fetch('https://es-design.onrender.com/api/telemetry/latest');
         const result = await response.json();
         
         if (result.status === 'success' && result.data) {
@@ -68,14 +67,12 @@ export default function App() {
           const data = result.data;
           const currentTime = new Date().toLocaleTimeString();
 
-          // Cập nhật dữ liệu vào thẻ
           if (data.temperature !== undefined) setTemperature(Number(data.temperature).toFixed(1));
           if (data.humidity !== undefined) setHumidity(Number(data.humidity).toFixed(1));
           if (data.soilMoisture !== undefined) setSoilMoisture(Number(data.soilMoisture).toFixed(1));
           if (data.light !== undefined) setLight(Number(data.light).toFixed(0));
           if (data.vpd !== undefined) setVpd(Number(data.vpd).toFixed(2));
 
-          // Cập nhật dữ liệu động vào biểu đồ (giữ 10 mẫu gần nhất)
           setChartData(prev => {
             const newLabels = [...prev.labels, currentTime].slice(-10);
             const newTempData = [...prev.datasets[0].data, data.temperature || 30].slice(-10);
@@ -98,22 +95,27 @@ export default function App() {
     };
 
     fetchData();
-    const interval = setInterval(fetchData, 2000); // Cập nhật mỗi 2 giây
+    const interval = setInterval(fetchData, 2000); 
     return () => clearInterval(interval);
   }, []);
 
   const handleWaterNow = async () => {
     setIsPumping(true);
     try {
-      await fetch('https://region-twisted-overkill.ngrok-free.dev/api/control/pump', {
+      // ĐÃ CẬP NHẬT LINK CLOUD RENDER
+      await fetch('https://es-design.onrender.com/api/control/pump', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json'
+        },
         body: JSON.stringify({ state: 'ON' })
       });
       setTimeout(async () => {
-        await fetch('https://region-twisted-overkill.ngrok-free.dev/api/control/pump', {
+        await fetch('https://es-design.onrender.com/api/control/pump', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 
+            'Content-Type': 'application/json'
+          },
           body: JSON.stringify({ state: 'OFF' })
         });
         setIsPumping(false);
@@ -140,7 +142,6 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-100 text-slate-800 p-4 md:p-6 flex flex-col items-center">
-      {/* Header */}
       <div className="w-full max-w-7xl bg-white shadow-sm rounded-2xl p-4 mb-6 flex justify-between items-center border border-slate-200">
         <h1 className="text-2xl md:text-3xl font-extrabold text-emerald-700 flex items-center gap-2">
           🌱 Bảng điều khiển cây trồng thông minh AloT
@@ -155,7 +156,6 @@ export default function App() {
         </div>
       </div>
 
-      {/* 5 Thẻ thông số cảm biến */}
       <div className="w-full max-w-7xl grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
         <div className="bg-white p-4 rounded-2xl shadow-sm border border-slate-200 text-center">
           <p className="text-xs font-bold text-slate-400 uppercase mb-1">ĐỘ ẨM ĐẤT</p>
@@ -180,7 +180,6 @@ export default function App() {
         </div>
       </div>
 
-      {/* Khu vực Biểu đồ và Bảng điều khiển */}
       <div className="w-full max-w-7xl grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="lg:col-span-2 bg-white p-6 rounded-2xl shadow-sm border border-slate-200 flex flex-col">
           <h2 className="font-bold text-slate-700 mb-4 flex items-center gap-2">
