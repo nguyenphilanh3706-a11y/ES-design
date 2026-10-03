@@ -1,13 +1,21 @@
 """
-Backend cho AI/firmware mới.
+Backend AIoT cây trồng.
 
-Dữ liệu:
-- Nhiệt độ, độ ẩm không khí, VPD, ánh sáng, độ ẩm đất.
-- Dự báo độ ẩm đất và ánh sáng sau 60 phút.
-- Trạng thái bơm, chế độ, FSM, bình nước và lỗi.
+- Nhận telemetry và ACK qua MQTT.
+- Lưu dữ liệu vào PostgreSQL.
+- Điều khiển chế độ và bơm qua MQTT.
+- Dự đoán trên backend bằng ai_service.py.
+- Không tự bật bơm dựa trên dự đoán AI.
 
-Cấu hình lấy từ .env cùng thư mục.
-Không xóa hoặc thay đổi bảng sensor_data cũ.
+Các file cần có:
+BACKEND/
+    main.py
+    ai_service.py
+    .env
+    requirements.txt
+    models/
+        best_lstm_csv_huber.keras
+        inference_config.json
 """
 
 import json
@@ -33,14 +41,14 @@ from fastapi.responses import JSONResponse
 from psycopg2.extras import Json, RealDictCursor
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from ai_service import plant_ai
+
 
 # =========================================================
 # 1. CẤU HÌNH
 # =========================================================
 
 ENV_PATH = Path(__file__).with_name(".env")
-
-# Biến môi trường trên Render được ưu tiên hơn file .env.
 load_dotenv(ENV_PATH, override=False)
 
 logging.basicConfig(
@@ -105,13 +113,6 @@ ACK_FILTER = f"{PREFIX}/+/ack"
 # =========================================================
 
 def db(sql, params=(), fetch=None):
-    """
-    Chạy truy vấn trong một transaction.
-
-    - Thành công: commit.
-    - Có lỗi: rollback.
-    - Luôn đóng connection.
-    """
     connection = psycopg2.connect(
         DATABASE_URL,
         connect_timeout=5,
@@ -130,13 +131,9 @@ def db(sql, params=(), fetch=None):
                     return dict(row) if row is not None else None
 
                 if fetch == "all":
-                    return [
-                        dict(row)
-                        for row in cursor.fetchall()
-                    ]
+                    return [dict(row) for row in cursor.fetchall()]
 
                 return cursor.rowcount
-
     finally:
         connection.close()
 
@@ -181,7 +178,6 @@ def init_db():
 
 
 def log_database_error(context, error):
-    # Không in connection URI hoặc mật khẩu.
     log.error(
         "%s | loại=%s | SQLSTATE=%s",
         context,
@@ -216,6 +212,8 @@ class Telemetry(BaseModel):
     light: float = Field(ge=0, le=200000)
     soilMoisture: float = Field(ge=0, le=100)
 
+    # Giữ các trường này để tương thích publisher cũ.
+    # API latest sẽ thay bằng kết quả từ backend.
     predictedSoil: float | None = Field(
         default=None,
         ge=0,
@@ -228,7 +226,7 @@ class Telemetry(BaseModel):
     )
 
     predictionHorizonMinutes: Literal[60] = 60
-    aiReady: bool = Field(strict=True)
+    aiReady: bool = Field(default=False, strict=True)
 
     pump: Literal["ON", "OFF"]
     mode: Literal["AUTO", "MANUAL"]
@@ -300,7 +298,6 @@ def send_discord(message):
         )
         response.raise_for_status()
         return True
-
     except requests.RequestException:
         log.warning("Không gửi được cảnh báo Discord")
         return False
@@ -309,7 +306,6 @@ def send_discord(message):
 def maybe_alert(sample):
     global last_alert
 
-    # Không gửi cảnh báo tự động từ dữ liệu mô phỏng.
     if sample.simulated or not DISCORD_URL:
         return
 
@@ -333,7 +329,6 @@ def maybe_alert(sample):
     if executor is None:
         return
 
-    # Giới hạn toàn backend: tối đa một cảnh báo mỗi 5 phút.
     with alert_lock:
         now = time.monotonic()
 
@@ -344,8 +339,7 @@ def maybe_alert(sample):
 
     executor.submit(
         send_discord,
-        f"🌱 Thiết bị {sample.device_id}: "
-        + "; ".join(problems),
+        f"🌱 Thiết bị {sample.device_id}: " + "; ".join(problems),
     )
 
 
@@ -362,12 +356,10 @@ mqtt_client.username_pw_set(
     MQTT_USERNAME,
     MQTT_PASSWORD,
 )
-
 mqtt_client.reconnect_delay_set(
     min_delay=2,
     max_delay=30,
 )
-
 mqtt_client.max_queued_messages_set(100)
 
 if MQTT_TLS:
@@ -378,10 +370,7 @@ def on_connect(client, userdata, flags, reason_code, properties):
     mqtt_ready.clear()
 
     if reason_code.is_failure:
-        log.error(
-            "MQTT từ chối kết nối: %s",
-            reason_code,
-        )
+        log.error("MQTT từ chối kết nối: %s", reason_code)
         return
 
     result, _ = client.subscribe([
@@ -565,6 +554,7 @@ def on_message(client, userdata, msg):
                 "Thiết bị báo bơm ON khi hết nước hoặc đang lỗi"
             )
 
+        # Lưu bản tin gốc. Không chạy LSTM trong callback MQTT.
         inserted = db(
             """
             INSERT INTO telemetry_v2 (
@@ -601,7 +591,6 @@ def on_message(client, userdata, msg):
         maybe_alert(sample)
 
     except ValidationError as error:
-        # Chỉ ghi tên trường và loại lỗi, không ghi toàn bộ payload.
         details = [
             {
                 "field": ".".join(str(part) for part in item["loc"]),
@@ -701,7 +690,7 @@ async def lifespan(app):
 
 app = FastAPI(
     title="Plant AIoT Backend",
-    version="2.1.1",
+    version="2.2.0",
     lifespan=lifespan,
 )
 
@@ -781,8 +770,9 @@ def serialize(row):
 def root():
     return {
         "status": "success",
-        "message": "Plant AIoT Backend 2.1.1",
+        "message": "Plant AIoT Backend 2.2.0",
         "mqttConnected": mqtt_ready.is_set(),
+        "aiExecution": "backend",
     }
 
 
@@ -812,11 +802,17 @@ def latest(
     ),
 ):
     row = latest_row(device_id)
+    payload = serialize(row) if row is not None else None
+
+    if payload is not None:
+        # Hàm đồng bộ được FastAPI chạy trong thread pool.
+        # ai_service có khóa và cache để tránh suy luận trùng.
+        payload = plant_ai.enrich(payload, db)
 
     return {
         "status": "success",
         "mqttConnected": mqtt_ready.is_set(),
-        "data": serialize(row) if row is not None else None,
+        "data": payload,
     }
 
 
@@ -832,6 +828,8 @@ def history(
     limit: int = Query(default=1000, ge=1, le=5000),
     before_id: int | None = Query(default=None, ge=1),
 ):
+    # Trả lịch sử bản tin gốc, không suy luận lại từng dòng.
+    # Dự đoán LSTM backend hiện chỉ bổ sung ở API latest.
     rows = db(
         """
         SELECT id, received_at, payload
@@ -886,6 +884,7 @@ def dispatch(device_id, kind, values):
             detail="Chưa có dữ liệu thiết bị",
         )
 
+    # Điều khiển dùng trạng thái thiết bị, không phụ thuộc AI.
     telemetry = serialize(row)
 
     if not telemetry["online"]:
@@ -916,7 +915,10 @@ def dispatch(device_id, kind, values):
                 detail="Đất đã đạt ngưỡng đủ ẩm",
             )
 
-        if telemetry["fsm"] != "IDLE":
+        if (
+            telemetry["fsm"] != "IDLE"
+            or telemetry["pump"] != "OFF"
+        ):
             raise HTTPException(
                 status_code=409,
                 detail="Thiết bị chưa sẵn sàng cho lần tưới mới",
@@ -1094,4 +1096,4 @@ def test_discord():
     return {
         "status": "success",
         "message": "Đã gửi Discord",
-    }   
+    }
