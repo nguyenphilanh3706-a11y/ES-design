@@ -1,0 +1,47 @@
+{
+  "model_version": "lstm_csv_v1",
+  "features": [
+    "TEMP",
+    "HUM",
+    "VPD",
+    "LUX",
+    "SOIL_PCT"
+  ],
+  "lookback_steps": 60,
+  "sample_seconds": 30,
+  "forecast_minutes": 60,
+  "input_scale": [
+    0.07507507507507505,
+    0.018148820326678767,
+    0.28686173264486514,
+    1.1145053992214067e-05,
+    0.02040816326530612
+  ],
+  "input_offset": [
+    -1.7499999999999993,
+    -0.7531760435571688,
+    -0.02782558806655192,
+    0.0,
+    -0.9591836734693877
+  ],
+  "train_min": [
+    23.31,
+    41.5,
+    0.097,
+    0.0,
+    47.0
+  ],
+  "train_max": [
+    36.63,
+    96.6,
+    3.583,
+    89725.9,
+    96.0
+  ],
+  "soil_output": "soil_delta",
+  "soil_delta_unit": 1.0,
+  "lux_output": "lux_future",
+  "lux_unit": 10000.0,
+  "training_file": "sensor_data_diverse_7days.csv",
+  "forecast_assumption": "Học theo diễn biến trong CSV; không có đầu vào mô tả lịch tưới hoặc mưa tương lai."
+}
