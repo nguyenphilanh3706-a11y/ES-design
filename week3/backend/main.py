@@ -604,6 +604,12 @@ def on_connect_fail(client, userdata):
 
 def store_ack(device_id, raw):
     ack = Ack.model_validate(raw)
+    if ack.simulated:
+        log.info(
+            "Bỏ qua ACK giả lập | device=%s",
+            ack.device_id,
+        )
+        return
 
     if ack.device_id != device_id:
         raise ValueError("ACK có device_id không khớp topic")
@@ -705,6 +711,12 @@ def on_message(client, userdata, msg):
             return
 
         sample = Telemetry.model_validate(raw)
+        if sample.simulated:
+            log.info(
+                "Bỏ qua dữ liệu giả lập | device=%s",
+                sample.device_id,
+            )
+            return
 
         if sample.device_id != device_id:
             raise ValueError(
@@ -939,6 +951,7 @@ def latest_row(device_id):
         SELECT id, received_at, payload
         FROM telemetry_v2
         WHERE device_id = %s
+          AND payload->'simulated' = 'false'::jsonb
         ORDER BY received_at DESC, id DESC
         LIMIT 1
         """,
@@ -1076,6 +1089,7 @@ def history(
         SELECT id, received_at, payload
         FROM telemetry_v2
         WHERE device_id = %s
+          AND payload->'simulated' = 'false'::jsonb
           AND received_at >= NOW() - (%s * INTERVAL '1 hour')
           AND (%s::bigint IS NULL OR id < %s::bigint)
         ORDER BY id DESC
@@ -1104,7 +1118,6 @@ def history(
             for row in reversed(rows)
         ],
     }
-
 
 # =========================================================
 # 9. GỬI LỆNH ĐIỀU KHIỂN
