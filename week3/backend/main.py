@@ -1,21 +1,18 @@
 """
-Backend AIoT cây trồng.
+Plant AIoT Backend — AI chạy trên ESP32 Week 2.
 
-- Nhận telemetry và ACK qua MQTT.
+Chức năng:
+- Nhận dữ liệu cảm biến, dự đoán AI và ACK qua MQTT.
 - Lưu dữ liệu vào PostgreSQL.
-- Điều khiển chế độ và bơm qua MQTT.
-- Dự đoán trên backend bằng ai_service.py.
-- Không tự bật bơm dựa trên dự đoán AI.
+- Trả dữ liệu cho frontend.
+- Gửi lệnh AUTO/MANUAL và bật/tắt bơm.
+- Không chạy TensorFlow hoặc LSTM trên backend.
 
-Các file cần có:
+Các file cần dùng:
 BACKEND/
     main.py
-    ai_service.py
-    .env
     requirements.txt
-    models/
-        best_lstm_csv_huber.keras
-        inference_config.json
+    .env
 """
 
 import json
@@ -41,8 +38,6 @@ from fastapi.responses import JSONResponse
 from psycopg2.extras import Json, RealDictCursor
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from ai_service import plant_ai
-
 
 # =========================================================
 # 1. CẤU HÌNH
@@ -57,11 +52,17 @@ logging.basicConfig(
 )
 log = logging.getLogger("plant-backend")
 
+APP_VERSION = "2.3.0"
+AI_SOURCE = "esp32_week2"
+PREDICTION_MAX_AGE_SECONDS = 90
+
 
 def required(name: str) -> str:
     value = os.getenv(name, "").strip()
+
     if not value:
         raise RuntimeError(f"Thiếu cấu hình {name}")
+
     return value
 
 
@@ -87,9 +88,11 @@ DEVICE_TIMEOUT = max(
     5,
     int(os.getenv("DEVICE_TIMEOUT_SECONDS", "20")),
 )
-COMMAND_TTL = max(
-    5,
-    int(os.getenv("COMMAND_TTL_SECONDS", "15")),
+
+# Firmware đã gửi chấp nhận lệnh có thời hạn tối đa 60 giây.
+COMMAND_TTL = min(
+    60,
+    max(5, int(os.getenv("COMMAND_TTL_SECONDS", "15"))),
 )
 
 ORIGINS = [
@@ -98,14 +101,14 @@ ORIGINS = [
     if item.strip()
 ]
 
+TELEMETRY_FILTER = f"{PREFIX}/+/telemetry"
+ACK_FILTER = f"{PREFIX}/+/ack"
+
 mqtt_ready = threading.Event()
 stopping = threading.Event()
 
 alert_lock = threading.Lock()
 last_alert = None
-
-TELEMETRY_FILTER = f"{PREFIX}/+/telemetry"
-ACK_FILTER = f"{PREFIX}/+/ack"
 
 
 # =========================================================
@@ -212,13 +215,13 @@ class Telemetry(BaseModel):
     light: float = Field(ge=0, le=200000)
     soilMoisture: float = Field(ge=0, le=100)
 
-    # Giữ các trường này để tương thích publisher cũ.
-    # API latest sẽ thay bằng kết quả từ backend.
+    # Kết quả AI do ESP32 gửi.
     predictedSoil: float | None = Field(
         default=None,
         ge=0,
         le=100,
     )
+
     predictedLight: float | None = Field(
         default=None,
         ge=0,
@@ -227,6 +230,24 @@ class Telemetry(BaseModel):
 
     predictionHorizonMinutes: Literal[60] = 60
     aiReady: bool = Field(default=False, strict=True)
+
+    aiMessage: str | None = Field(
+        default=None,
+        max_length=500,
+    )
+
+    soilPredictionSource: str | None = Field(
+        default=None,
+        max_length=64,
+    )
+
+    lightPredictionSource: str | None = Field(
+        default=None,
+        max_length=64,
+    )
+
+    predictionInputAt: datetime | None = None
+    predictionTargetAt: datetime | None = None
 
     pump: Literal["ON", "OFF"]
     mode: Literal["AUTO", "MANUAL"]
@@ -238,6 +259,8 @@ class Telemetry(BaseModel):
 
 
 class Ack(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     command_id: UUID
 
     device_id: str = Field(
@@ -248,6 +271,7 @@ class Ack(BaseModel):
 
     status: Literal["applied", "rejected", "completed"]
     message: str = Field(default="", max_length=300)
+
     pump: Literal["ON", "OFF"]
     mode: Literal["AUTO", "MANUAL"]
     simulated: bool = Field(strict=True)
@@ -283,7 +307,149 @@ class ModeRequest(BaseModel):
 
 
 # =========================================================
-# 4. DISCORD
+# 4. XỬ LÝ KẾT QUẢ AI TỪ ESP32
+# =========================================================
+
+def parse_prediction_time(value):
+    if not isinstance(value, str) or not value:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        return None
+
+    return parsed.astimezone(timezone.utc)
+
+
+def clear_prediction(payload, message):
+    payload.update({
+        "aiReady": False,
+        "predictedSoil": None,
+        "predictedLight": None,
+        "predictionInputAt": None,
+        "predictionTargetAt": None,
+        "aiMessage": message,
+    })
+
+    return payload
+
+
+def normalize_kit_prediction(payload, sampled_at):
+    """
+    Kiểm tra thông tin dự đoán do kit gửi.
+
+    Không chạy mô hình, không tự tạo dự đoán và không áp dụng
+    scaler/phạm vi huấn luyện của mô hình Huber trước đây.
+    """
+
+    if payload.get("simulated") is not False:
+        return clear_prediction(
+            payload,
+            "Đang nhận dữ liệu mô phỏng; "
+            "chưa xác nhận dự đoán từ kit Week 2.",
+        )
+
+    sources_match = (
+        payload.get("soilPredictionSource") == AI_SOURCE
+        and payload.get("lightPredictionSource") == AI_SOURCE
+    )
+
+    if not sources_match:
+        return clear_prediction(
+            payload,
+            "Bản tin chưa có nguồn dự đoán esp32_week2. "
+            "Cần dùng firmware Week 2 có tích hợp MQTT đã gửi.",
+        )
+
+    if payload.get("fault") or payload.get("fsm") == "FAULT":
+        return clear_prediction(
+            payload,
+            "Thiết bị đang báo lỗi. Tạm không hiển thị dự đoán.",
+        )
+
+    if payload.get("aiReady") is not True:
+        return clear_prediction(
+            payload,
+            payload.get("aiMessage")
+            or (
+                "ESP32 chưa có kết quả AI; "
+                "đang chờ kit thu thập dữ liệu và chạy mô hình."
+            ),
+        )
+
+    soil = payload.get("predictedSoil")
+    light = payload.get("predictedLight")
+
+    valid_values = (
+        type(soil) in (int, float)
+        and type(light) in (int, float)
+        and 0 <= soil <= 100
+        and 0 <= light <= 200000
+    )
+
+    if not valid_values:
+        return clear_prediction(
+            payload,
+            "Kết quả dự đoán từ ESP32 thiếu hoặc không hợp lệ.",
+        )
+
+    input_at = parse_prediction_time(
+        payload.get("predictionInputAt")
+    )
+
+    target_at = parse_prediction_time(
+        payload.get("predictionTargetAt")
+    )
+
+    if input_at is None or target_at is None:
+        return clear_prediction(
+            payload,
+            "ESP32 chưa gửi đủ thời điểm đầu vào và dự đoán.",
+        )
+
+    # Đánh giá dự đoán tại thời điểm bản tin được tạo.
+    # Nhờ vậy, API lịch sử vẫn giữ dự đoán hợp lệ trước đây.
+    prediction_age = (
+        sampled_at - input_at
+    ).total_seconds()
+
+    horizon_seconds = (
+        target_at - input_at
+    ).total_seconds()
+
+    if not -10 <= prediction_age <= PREDICTION_MAX_AGE_SECONDS:
+        return clear_prediction(
+            payload,
+            "Kết quả AI trên ESP32 đã cũ; chờ lần dự đoán mới.",
+        )
+
+    if (
+        payload.get("predictionHorizonMinutes") != 60
+        or abs(horizon_seconds - 3600) > 2
+    ):
+        return clear_prediction(
+            payload,
+            "Thời điểm dự đoán từ ESP32 không khớp mốc 60 phút.",
+        )
+
+    payload.update({
+        "aiReady": True,
+        "predictionInputAt": input_at.isoformat(),
+        "predictionTargetAt": target_at.isoformat(),
+        "aiMessage": "Dự đoán từ mô hình Week 2 chạy trên ESP32.",
+    })
+
+    return payload
+
+
+# =========================================================
+# 5. CẢNH BÁO DISCORD
 # =========================================================
 
 def send_discord(message):
@@ -298,6 +464,7 @@ def send_discord(message):
         )
         response.raise_for_status()
         return True
+
     except requests.RequestException:
         log.warning("Không gửi được cảnh báo Discord")
         return False
@@ -326,6 +493,7 @@ def maybe_alert(sample):
         return
 
     executor = getattr(app.state, "alert_executor", None)
+
     if executor is None:
         return
 
@@ -339,12 +507,13 @@ def maybe_alert(sample):
 
     executor.submit(
         send_discord,
-        f"🌱 Thiết bị {sample.device_id}: " + "; ".join(problems),
+        f"🌱 Thiết bị {sample.device_id}: "
+        + "; ".join(problems),
     )
 
 
 # =========================================================
-# 5. MQTT
+# 6. MQTT
 # =========================================================
 
 mqtt_client = mqtt.Client(
@@ -356,10 +525,12 @@ mqtt_client.username_pw_set(
     MQTT_USERNAME,
     MQTT_PASSWORD,
 )
+
 mqtt_client.reconnect_delay_set(
     min_delay=2,
     max_delay=30,
 )
+
 mqtt_client.max_queued_messages_set(100)
 
 if MQTT_TLS:
@@ -423,6 +594,7 @@ def on_disconnect(client, userdata, flags, reason_code, properties):
 
 def on_connect_fail(client, userdata):
     mqtt_ready.clear()
+
     log.warning(
         "Không mở được kết nối MQTT | host=%s | port=%s",
         MQTT_HOST,
@@ -474,7 +646,8 @@ def store_ack(device_id, raw):
         )
     else:
         log.info(
-            "Bỏ qua ACK trùng, muộn hoặc không khớp lệnh | command=%s",
+            "Bỏ qua ACK trùng, muộn hoặc không khớp lệnh "
+            "| command=%s",
             ack.command_id,
         )
 
@@ -489,7 +662,10 @@ def on_message(client, userdata, msg):
 
     try:
         if msg.retain:
-            log.warning("Bỏ qua bản tin retained: %s", msg.topic)
+            log.warning(
+                "Bỏ qua bản tin retained: %s",
+                msg.topic,
+            )
             return
 
         if len(msg.payload) > 16384:
@@ -499,13 +675,19 @@ def on_message(client, userdata, msg):
         topic_prefix = PREFIX + "/"
 
         if not msg.topic.startswith(topic_prefix):
-            log.warning("Topic không khớp prefix: %s", msg.topic)
+            log.warning(
+                "Topic không khớp prefix: %s",
+                msg.topic,
+            )
             return
 
         parts = msg.topic[len(topic_prefix):].split("/")
 
         if len(parts) != 2:
-            log.warning("Cấu trúc topic không hợp lệ: %s", msg.topic)
+            log.warning(
+                "Cấu trúc topic không hợp lệ: %s",
+                msg.topic,
+            )
             return
 
         device_id, kind = parts
@@ -516,7 +698,10 @@ def on_message(client, userdata, msg):
             return
 
         if kind != "telemetry":
-            log.warning("Loại bản tin không được hỗ trợ: %s", kind)
+            log.warning(
+                "Loại bản tin không được hỗ trợ: %s",
+                kind,
+            )
             return
 
         sample = Telemetry.model_validate(raw)
@@ -527,25 +712,22 @@ def on_message(client, userdata, msg):
             )
 
         if sample.sampled_at.tzinfo is None:
-            raise ValueError("sampled_at phải có múi giờ")
+            raise ValueError(
+                "sampled_at phải có múi giờ"
+            )
 
-        age = (utcnow() - sample.sampled_at).total_seconds()
+        age = (
+            utcnow() - sample.sampled_at
+        ).total_seconds()
 
         if age < -10 or age > DEVICE_TIMEOUT:
             log.warning(
-                "Bỏ qua dữ liệu lệch thời gian | age=%.1fs | giới hạn=%ss",
+                "Bỏ qua dữ liệu lệch thời gian "
+                "| age=%.1fs | giới hạn=%ss",
                 age,
                 DEVICE_TIMEOUT,
             )
             return
-
-        if sample.aiReady and (
-            sample.predictedSoil is None
-            or sample.predictedLight is None
-        ):
-            raise ValueError(
-                "aiReady=true nhưng thiếu predictedSoil hoặc predictedLight"
-            )
 
         if sample.pump == "ON" and (
             not sample.waterAvailable or sample.fault
@@ -554,7 +736,8 @@ def on_message(client, userdata, msg):
                 "Thiết bị báo bơm ON khi hết nước hoặc đang lỗi"
             )
 
-        # Lưu bản tin gốc. Không chạy LSTM trong callback MQTT.
+        # Lưu bản tin đã kiểm tra định dạng, bao gồm metadata AI.
+        # Không gọi TensorFlow hoặc ai_service.
         inserted = db(
             """
             INSERT INTO telemetry_v2 (
@@ -582,10 +765,12 @@ def on_message(client, userdata, msg):
             return
 
         log.info(
-            "ĐÃ LƯU DATABASE | id=%s | device=%s | đất=%.1f%%",
+            "ĐÃ LƯU DATABASE | id=%s | device=%s "
+            "| đất=%.1f%% | kit_ai_ready=%s",
             inserted["id"],
             sample.device_id,
             sample.soilMoisture,
+            sample.aiReady,
         )
 
         maybe_alert(sample)
@@ -593,7 +778,9 @@ def on_message(client, userdata, msg):
     except ValidationError as error:
         details = [
             {
-                "field": ".".join(str(part) for part in item["loc"]),
+                "field": ".".join(
+                    str(part) for part in item["loc"]
+                ),
                 "type": item["type"],
                 "message": item["msg"],
             }
@@ -602,7 +789,11 @@ def on_message(client, userdata, msg):
                 include_url=False,
             )
         ]
-        log.warning("Dữ liệu không đúng định dạng: %s", details)
+
+        log.warning(
+            "Dữ liệu không đúng định dạng: %s",
+            details,
+        )
 
     except UnicodeError:
         log.warning("Bản tin không phải chuỗi UTF-8 hợp lệ")
@@ -634,7 +825,7 @@ mqtt_client.on_message = on_message
 
 
 # =========================================================
-# 6. KHỞI ĐỘNG / DỪNG ỨNG DỤNG
+# 7. KHỞI ĐỘNG / DỪNG BACKEND
 # =========================================================
 
 @asynccontextmanager
@@ -642,9 +833,15 @@ async def lifespan(app):
     stopping.clear()
     mqtt_ready.clear()
 
-    log.info("File backend: %s", Path(__file__).resolve())
     log.info(
-        "BACKEND | host=%s | port=%s | prefix=%s | device=%s",
+        "File backend: %s",
+        Path(__file__).resolve(),
+    )
+
+    log.info(
+        "BACKEND | version=%s | host=%s | port=%s "
+        "| prefix=%s | device=%s | ai=ESP32 Week 2",
+        APP_VERSION,
         MQTT_HOST,
         MQTT_PORT,
         PREFIX,
@@ -689,8 +886,8 @@ async def lifespan(app):
 
 
 app = FastAPI(
-    title="Plant AIoT Backend",
-    version="2.2.0",
+    title="Plant AIoT Backend — ESP32 Week 2",
+    version=APP_VERSION,
     lifespan=lifespan,
 )
 
@@ -705,7 +902,10 @@ app.add_middleware(
 
 @app.exception_handler(psycopg2.Error)
 async def database_error(request, error):
-    log_database_error("Database không khả dụng", error)
+    log_database_error(
+        "Database không khả dụng",
+        error,
+    )
 
     return JSONResponse(
         status_code=503,
@@ -717,7 +917,7 @@ async def database_error(request, error):
 
 
 # =========================================================
-# 7. XÁC THỰC VÀ ĐỌC DỮ LIỆU
+# 8. XÁC THỰC VÀ CHUYỂN DỮ LIỆU CHO WEB
 # =========================================================
 
 def authorize(
@@ -749,7 +949,10 @@ def latest_row(device_id):
 
 def serialize(row):
     payload = dict(row["payload"])
-    sampled_at = datetime.fromisoformat(payload["sampled_at"])
+
+    sampled_at = datetime.fromisoformat(
+        payload["sampled_at"].replace("Z", "+00:00")
+    )
 
     age = max(
         0.0,
@@ -761,18 +964,24 @@ def serialize(row):
         "receivedAt": row["received_at"].isoformat(),
         "dataAgeSeconds": round(age, 1),
         "online": age <= DEVICE_TIMEOUT,
+        "aiExecution": "esp32",
     })
 
-    return payload
+    return normalize_kit_prediction(
+        payload,
+        sampled_at,
+    )
 
 
 @app.get("/")
 def root():
     return {
         "status": "success",
-        "message": "Plant AIoT Backend 2.2.0",
+        "message": (
+            f"Plant AIoT Backend {APP_VERSION} — ESP32 Week 2"
+        ),
         "mqttConnected": mqtt_ready.is_set(),
-        "aiExecution": "backend",
+        "aiExecution": "esp32",
     }
 
 
@@ -789,6 +998,7 @@ def health():
             result is not None and result["ok"] == 1
         ),
         "mqttConnected": mqtt_ready.is_set(),
+        "aiExecution": "esp32",
     }
 
 
@@ -805,9 +1015,42 @@ def latest(
     payload = serialize(row) if row is not None else None
 
     if payload is not None:
-        # Hàm đồng bộ được FastAPI chạy trong thread pool.
-        # ai_service có khóa và cache để tránh suy luận trùng.
-        payload = plant_ai.enrich(payload, db)
+        if not payload["online"]:
+            clear_prediction(
+                payload,
+                "Thiết bị offline hoặc dữ liệu đã cũ. "
+                "Đang chờ bản tin mới từ ESP32.",
+            )
+
+        elif not mqtt_ready.is_set():
+            clear_prediction(
+                payload,
+                "Backend đang mất kết nối MQTT. "
+                "Tạm không hiển thị dự đoán trực tiếp.",
+            )
+
+        elif payload.get("aiReady"):
+            # API latest kiểm tra thêm tuổi dự đoán ở hiện tại.
+            input_at = parse_prediction_time(
+                payload.get("predictionInputAt")
+            )
+
+            if input_at is None:
+                clear_prediction(
+                    payload,
+                    "Chưa có thời điểm đầu vào dự đoán hợp lệ.",
+                )
+            else:
+                age = (
+                    utcnow() - input_at
+                ).total_seconds()
+
+                if not -10 <= age <= PREDICTION_MAX_AGE_SECONDS:
+                    clear_prediction(
+                        payload,
+                        "Kết quả AI trên ESP32 đã cũ; "
+                        "chờ lần dự đoán mới.",
+                    )
 
     return {
         "status": "success",
@@ -828,8 +1071,6 @@ def history(
     limit: int = Query(default=1000, ge=1, le=5000),
     before_id: int | None = Query(default=None, ge=1),
 ):
-    # Trả lịch sử bản tin gốc, không suy luận lại từng dòng.
-    # Dự đoán LSTM backend hiện chỉ bổ sung ở API latest.
     rows = db(
         """
         SELECT id, received_at, payload
@@ -866,7 +1107,7 @@ def history(
 
 
 # =========================================================
-# 8. GỬI LỆNH ĐIỀU KHIỂN
+# 9. GỬI LỆNH ĐIỀU KHIỂN
 # =========================================================
 
 def dispatch(device_id, kind, values):
@@ -884,7 +1125,8 @@ def dispatch(device_id, kind, values):
             detail="Chưa có dữ liệu thiết bị",
         )
 
-    # Điều khiển dùng trạng thái thiết bị, không phụ thuộc AI.
+    # Điều khiển dựa trên trạng thái thiết bị.
+    # Không yêu cầu AI phải sẵn sàng.
     telemetry = serialize(row)
 
     if not telemetry["online"]:
@@ -902,7 +1144,7 @@ def dispatch(device_id, kind, values):
 
         if (
             not telemetry["waterAvailable"]
-            or telemetry["fault"]
+            or telemetry.get("fault")
         ):
             raise HTTPException(
                 status_code=409,
@@ -937,7 +1179,7 @@ def dispatch(device_id, kind, values):
         **values,
     }
 
-    # Lưu trước khi publish để ACK nhanh vẫn tìm được lệnh.
+    # Lưu trước khi gửi để ACK nhanh vẫn tìm được lệnh.
     db(
         """
         INSERT INTO commands_v2 (
@@ -984,7 +1226,8 @@ def dispatch(device_id, kind, values):
         )
 
     log.info(
-        "Đã xếp hàng gửi lệnh | command=%s | device=%s | type=%s",
+        "Đã xếp hàng gửi lệnh | command=%s "
+        "| device=%s | type=%s",
         command_id,
         device_id,
         kind,
@@ -1071,6 +1314,10 @@ def command_status(command_id: UUID):
         "data": row,
     }
 
+
+# =========================================================
+# 10. KIỂM TRA KẾT NỐI DISCORD
+# =========================================================
 
 @app.post(
     "/api/test-discord",
