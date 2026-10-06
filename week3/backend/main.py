@@ -15,6 +15,7 @@ BACKEND/
     .env
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -32,9 +33,9 @@ import paho.mqtt.client as mqtt
 import psycopg2
 import requests
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from psycopg2.extras import Json, RealDictCursor
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -109,6 +110,33 @@ stopping = threading.Event()
 
 alert_lock = threading.Lock()
 last_alert = None
+
+# Các trình duyệt đang nghe luồng SSE (cập nhật tức thì khi ESP32 gửi bản tin)
+sse_subscribers = set()
+
+
+def _push(queue, item):
+    try:
+        queue.put_nowait(item)
+    except asyncio.QueueFull:
+        pass
+
+
+def broadcast_latest(device_id, row):
+    """Gọi từ luồng MQTT ngay sau khi lưu DB: đẩy bản tin mới tới mọi web đang mở."""
+    loop = getattr(app.state, "loop", None)
+
+    if loop is None or not sse_subscribers:
+        return
+
+    try:
+        message = json.dumps(latest_response(device_id, row), default=str)
+    except Exception:
+        log.warning("Không tạo được bản tin SSE")
+        return
+
+    for queue in list(sse_subscribers):
+        loop.call_soon_threadsafe(_push, queue, (device_id, message))
 
 
 # =========================================================
@@ -787,6 +815,15 @@ def on_message(client, userdata, msg):
 
         maybe_alert(sample)
 
+        broadcast_latest(
+            sample.device_id,
+            {
+                "id": inserted["id"],
+                "received_at": utcnow(),
+                "payload": sample.model_dump(mode="json"),
+            },
+        )
+
     except ValidationError as error:
         details = [
             {
@@ -836,6 +873,36 @@ mqtt_client.on_connect_fail = on_connect_fail
 mqtt_client.on_message = on_message
 
 
+def mqtt_watchdog():
+    """Nếu backend mất MQTT quá 90 giây thì chủ động kết nối lại (paho thường tự lo,
+    đây là lớp dự phòng khi đăng ký topic thất bại hoặc kết nối treo)."""
+    down_since = None
+
+    while not stopping.wait(20):
+        if mqtt_ready.is_set():
+            down_since = None
+            continue
+
+        now = time.monotonic()
+
+        if down_since is None:
+            down_since = now
+            continue
+
+        if now - down_since > 90:
+            log.warning("MQTT mất quá 90 giây, thử kết nối lại")
+
+            try:
+                mqtt_client.reconnect()
+            except Exception as error:
+                log.warning(
+                    "Kết nối lại MQTT thất bại | loại=%s",
+                    type(error).__name__,
+                )
+
+            down_since = now
+
+
 # =========================================================
 # 7. KHỞI ĐỘNG / DỪNG BACKEND
 # =========================================================
@@ -862,6 +929,8 @@ async def lifespan(app):
 
     init_db()
 
+    app.state.loop = asyncio.get_running_loop()
+
     executor = ThreadPoolExecutor(max_workers=1)
     app.state.alert_executor = executor
     loop_started = False
@@ -881,6 +950,13 @@ async def lifespan(app):
             )
 
         loop_started = True
+
+        threading.Thread(
+            target=mqtt_watchdog,
+            name="mqtt-watchdog",
+            daemon=True,
+        ).start()
+
         yield
 
     finally:
@@ -1024,7 +1100,14 @@ def latest(
         pattern=r"^[A-Za-z0-9_-]+$",
     ),
 ):
-    row = latest_row(device_id)
+    return latest_response(device_id)
+
+
+def latest_response(device_id, row=None):
+    # row=None: đọc DB (API polling). row có sẵn: dùng thẳng (đẩy SSE, khỏi truy vấn lại)
+    if row is None:
+        row = latest_row(device_id)
+
     payload = serialize(row) if row is not None else None
 
     if payload is not None:
@@ -1118,6 +1201,52 @@ def history(
             for row in reversed(rows)
         ],
     }
+
+@app.get("/api/telemetry/stream")
+async def telemetry_stream(
+    request: Request,
+    device_id: str = Query(
+        default=DEVICE_ID,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    ),
+):
+    """Server-Sent Events: web nhận bản tin ngay khi ESP32 gửi, không chờ polling."""
+    queue = asyncio.Queue(maxsize=50)
+    sse_subscribers.add(queue)
+
+    async def generate():
+        try:
+            yield "retry: 2000\n\n"
+
+            while True:
+                if await request.is_disconnected():
+                    break
+
+                try:
+                    target, message = await asyncio.wait_for(
+                        queue.get(),
+                        timeout=15,
+                    )
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+
+                if target == device_id:
+                    yield f"data: {message}\n\n"
+        finally:
+            sse_subscribers.discard(queue)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
 
 # =========================================================
 # 9. GỬI LỆNH ĐIỀU KHIỂN
