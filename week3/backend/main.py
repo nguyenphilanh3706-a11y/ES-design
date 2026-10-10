@@ -28,6 +28,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 from uuid import UUID, uuid4
+from collections import OrderedDict
+from queue import Queue, Empty, Full
 
 import paho.mqtt.client as mqtt
 import psycopg2
@@ -82,7 +84,7 @@ MQTT_TLS = os.getenv("MQTT_TLS", "true").lower() == "true"
 PREFIX = os.getenv("MQTT_PREFIX", "plant/v2").strip().strip("/")
 DEVICE_ID = os.getenv("DEVICE_ID", "esp32_v1").strip()
 
-CONTROL_KEY = required("CONTROL_API_KEY")
+CONTROL_KEY = os.getenv("CONTROL_API_KEY", "").strip()
 DISCORD_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
 DEVICE_TIMEOUT = max(
@@ -111,33 +113,196 @@ stopping = threading.Event()
 alert_lock = threading.Lock()
 last_alert = None
 
-# Các trình duyệt đang nghe luồng SSE (cập nhật tức thì khi ESP32 gửi bản tin)
-sse_subscribers = set()
+
+# Dữ liệu trực tiếp: không chờ database.
+live_lock = threading.Lock()
+live_rows = OrderedDict()
+seen_samples = OrderedDict()
+
+# Chỉ truy cập danh sách người nghe SSE trên event loop FastAPI.
+sse_subscribers = {}
+
+# Hàng đợi giới hạn dung lượng để tránh tăng RAM không kiểm soát.
+telemetry_jobs = Queue(maxsize=256)
+ack_jobs = Queue(maxsize=64)
+io_stopping = threading.Event()
 
 
-def _push(queue, item):
-    try:
-        queue.put_nowait(item)
-    except asyncio.QueueFull:
-        pass
+def wake_subscribers(device_id):
+    for event in tuple(sse_subscribers.get(device_id, ())):
+        event.set()
 
 
-def broadcast_latest(device_id, row):
-    """Gọi từ luồng MQTT ngay sau khi lưu DB: đẩy bản tin mới tới mọi web đang mở."""
+def accept_live(sample, received_at):
+    payload = sample.model_dump(mode="json")
+    key = str(sample.sample_id)
+    changed = False
+
+    with live_lock:
+        if key in seen_samples:
+            return False
+
+        seen_samples[key] = None
+
+        if len(seen_samples) > 4096:
+            seen_samples.popitem(last=False)
+
+        previous = live_rows.get(sample.device_id)
+
+        # Không để mẫu đến muộn ghi đè mẫu mới.
+        if (
+            previous is None
+            or sample.sampled_at >= previous["sampled_at"]
+        ):
+            live_rows[sample.device_id] = {
+                "id": None,
+                "received_at": received_at,
+                "sampled_at": sample.sampled_at,
+                "payload": payload,
+            }
+
+            live_rows.move_to_end(sample.device_id)
+
+            if len(live_rows) > 128:
+                live_rows.popitem(last=False)
+
+            changed = True
+
     loop = getattr(app.state, "loop", None)
 
-    if loop is None or not sse_subscribers:
-        return
+    if changed and loop is not None:
+        try:
+            loop.call_soon_threadsafe(
+                wake_subscribers,
+                sample.device_id,
+            )
+        except RuntimeError:
+            pass
 
+    return True
+
+
+def queue_telemetry(sample, received_at):
     try:
-        message = json.dumps(latest_response(device_id, row), default=str)
-    except Exception:
-        log.warning("Không tạo được bản tin SSE")
-        return
+        telemetry_jobs.put_nowait((sample, received_at))
+    except Full:
+        # Không chặn MQTT khi database mất kết nối quá lâu.
+        log.error(
+            "Hàng đợi DB đầy: không lưu được mẫu %s",
+            sample.sample_id,
+        )
 
-    for queue in list(sse_subscribers):
-        loop.call_soon_threadsafe(_push, queue, (device_id, message))
 
+def telemetry_writer():
+    while not io_stopping.is_set() or not telemetry_jobs.empty():
+        try:
+            batch = [telemetry_jobs.get(timeout=0.5)]
+        except Empty:
+            continue
+
+        # Nếu có nhiều mẫu đang chờ, ghi chung một lần.
+        while len(batch) < 32:
+            try:
+                batch.append(telemetry_jobs.get_nowait())
+            except Empty:
+                break
+
+        placeholders = ", ".join(
+            ["(%s, %s, %s, %s)"] * len(batch)
+        )
+
+        sql = (
+            "INSERT INTO telemetry_v2 "
+            "(sample_id, device_id, received_at, payload) VALUES "
+            + placeholders
+            + " ON CONFLICT (sample_id) DO NOTHING"
+        )
+
+        params = []
+
+        for sample, received_at in batch:
+            params.extend((
+                str(sample.sample_id),
+                sample.device_id,
+                received_at,
+                Json(sample.model_dump(mode="json")),
+            ))
+
+        saved = False
+
+        try:
+            for attempt in range(3):
+                try:
+                    db(sql, tuple(params))
+                    saved = True
+                    break
+
+                except Exception as error:
+                    log.warning(
+                        "Ghi DB chậm/lỗi | lần=%s | loại=%s",
+                        attempt + 1,
+                        type(error).__name__,
+                    )
+
+                    if io_stopping.wait(attempt + 1):
+                        break
+
+            if saved:
+                log.info(
+                    "ĐÃ LƯU DATABASE | số_mẫu=%s",
+                    len(batch),
+                )
+
+                for sample, _ in batch:
+                    try:
+                        maybe_alert(sample)
+                    except Exception:
+                        log.warning("Không gửi được cảnh báo")
+            else:
+                log.error(
+                    "Không lưu được %s mẫu lịch sử; "
+                    "dữ liệu live vẫn tiếp tục",
+                    len(batch),
+                )
+
+        finally:
+            for _ in batch:
+                telemetry_jobs.task_done()
+
+
+def ack_writer():
+    while not io_stopping.is_set() or not ack_jobs.empty():
+        try:
+            device_id, raw, received_at = ack_jobs.get(
+                timeout=0.5
+            )
+        except Empty:
+            continue
+
+        try:
+            for attempt in range(3):
+                try:
+                    store_ack(device_id, raw, received_at)
+                    break
+
+                except Exception as error:
+                    log.warning(
+                        "Lưu ACK lỗi | lần=%s | loại=%s",
+                        attempt + 1,
+                        type(error).__name__,
+                    )
+
+                    if (
+                        attempt == 2
+                        or io_stopping.wait(attempt + 1)
+                    ):
+                        log.error(
+                            "Không lưu được ACK %s",
+                            raw.get("command_id"),
+                        )
+                        break
+        finally:
+            ack_jobs.task_done()
 
 # =========================================================
 # 2. DATABASE
@@ -630,31 +795,27 @@ def on_connect_fail(client, userdata):
     )
 
 
-def store_ack(device_id, raw):
-    ack = Ack.model_validate(raw)
-    if ack.simulated:
-        log.info(
-            "Bỏ qua ACK giả lập | device=%s",
-            ack.device_id,
-        )
-        return
+def store_ack(device_id, raw, received_at=None):
+    received_at = received_at or utcnow()
 
-    if ack.device_id != device_id:
-        raise ValueError("ACK có device_id không khớp topic")
+    ack = Ack.model_validate(raw)
+
+    if ack.simulated or ack.device_id != device_id:
+        return
 
     updated = db(
         """
         UPDATE commands_v2
         SET status = %s,
             message = %s,
-            acknowledged_at = NOW(),
+            acknowledged_at = %s,
             ack = %s
         WHERE command_id = %s
           AND device_id = %s
           AND (
               (
                   status = 'pending'
-                  AND expires_at >= NOW()
+                  AND expires_at >= %s
               )
               OR (
                   status = 'applied'
@@ -665,203 +826,108 @@ def store_ack(device_id, raw):
         (
             ack.status,
             ack.message,
+            received_at,
             Json(ack.model_dump(mode="json")),
             str(ack.command_id),
             device_id,
+            received_at,
             ack.status,
         ),
     )
 
-    if updated:
-        log.info(
-            "ĐÃ LƯU ACK | command=%s | status=%s",
-            ack.command_id,
-            ack.status,
-        )
-    else:
-        log.info(
-            "Bỏ qua ACK trùng, muộn hoặc không khớp lệnh "
-            "| command=%s",
-            ack.command_id,
-        )
+    log.info(
+        "ACK | command=%s | status=%s | updated=%s",
+        ack.command_id,
+        ack.status,
+        updated,
+    )
 
 
 def on_message(client, userdata, msg):
-    log.info(
-        "NHẬN MQTT | topic=%s | bytes=%d | retained=%s",
-        msg.topic,
-        len(msg.payload),
-        msg.retain,
-    )
+    received_at = utcnow()
 
     try:
-        if msg.retain:
-            log.warning(
-                "Bỏ qua bản tin retained: %s",
-                msg.topic,
-            )
+        if msg.retain or len(msg.payload) > 16384:
             return
 
-        if len(msg.payload) > 16384:
-            log.warning("Bỏ qua bản tin quá lớn")
+        prefix = PREFIX + "/"
+
+        if not msg.topic.startswith(prefix):
             return
 
-        topic_prefix = PREFIX + "/"
-
-        if not msg.topic.startswith(topic_prefix):
-            log.warning(
-                "Topic không khớp prefix: %s",
-                msg.topic,
-            )
-            return
-
-        parts = msg.topic[len(topic_prefix):].split("/")
+        parts = msg.topic[len(prefix):].split("/")
 
         if len(parts) != 2:
-            log.warning(
-                "Cấu trúc topic không hợp lệ: %s",
-                msg.topic,
-            )
             return
 
         device_id, kind = parts
         raw = json.loads(msg.payload.decode("utf-8"))
 
         if kind == "ack":
-            store_ack(device_id, raw)
+            ack = Ack.model_validate(raw)
+
+            if ack.simulated or ack.device_id != device_id:
+                return
+
+            try:
+                ack_jobs.put_nowait(
+                    (device_id, raw, received_at)
+                )
+            except Full:
+                log.error(
+                    "Hàng đợi ACK đầy | command=%s",
+                    ack.command_id,
+                )
+
             return
 
         if kind != "telemetry":
-            log.warning(
-                "Loại bản tin không được hỗ trợ: %s",
-                kind,
-            )
             return
 
         sample = Telemetry.model_validate(raw)
+
         if sample.simulated:
-            log.info(
-                "Bỏ qua dữ liệu giả lập | device=%s",
-                sample.device_id,
-            )
             return
 
         if sample.device_id != device_id:
-            raise ValueError(
-                "device_id trong dữ liệu không khớp topic"
-            )
+            raise ValueError("device_id không khớp topic")
 
         if sample.sampled_at.tzinfo is None:
-            raise ValueError(
-                "sampled_at phải có múi giờ"
-            )
+            raise ValueError("sampled_at thiếu múi giờ")
 
         age = (
-            utcnow() - sample.sampled_at
+            received_at - sample.sampled_at
         ).total_seconds()
 
-        if age < -10 or age > DEVICE_TIMEOUT:
+        if not -10 <= age <= DEVICE_TIMEOUT:
             log.warning(
-                "Bỏ qua dữ liệu lệch thời gian "
-                "| age=%.1fs | giới hạn=%ss",
+                "Bỏ qua mẫu cũ/lệch giờ | age=%.2fs",
                 age,
-                DEVICE_TIMEOUT,
             )
             return
 
-        if sample.pump == "ON" and (
-            not sample.waterAvailable or sample.fault
-        ):
-            log.warning(
-                "Thiết bị báo bơm ON khi hết nước hoặc đang lỗi"
-            )
-
-        # Lưu bản tin đã kiểm tra định dạng, bao gồm metadata AI.
-        # Không gọi TensorFlow hoặc ai_service.
-        inserted = db(
-            """
-            INSERT INTO telemetry_v2 (
-                sample_id,
-                device_id,
-                payload
-            )
-            VALUES (%s, %s, %s)
-            ON CONFLICT (sample_id) DO NOTHING
-            RETURNING id
-            """,
-            (
-                str(sample.sample_id),
-                sample.device_id,
-                Json(sample.model_dump(mode="json")),
-            ),
-            fetch="one",
-        )
-
-        if inserted is None:
-            log.info(
-                "Bỏ qua mẫu trùng | sample=%s",
-                sample.sample_id,
-            )
+        # Cập nhật bộ nhớ và đánh thức SSE trước.
+        if not accept_live(sample, received_at):
             return
 
         log.info(
-            "ĐÃ LƯU DATABASE | id=%s | device=%s "
-            "| đất=%.1f%% | kit_ai_ready=%s",
-            inserted["id"],
-            sample.device_id,
-            sample.soilMoisture,
-            sample.aiReady,
+            "NHẬN MQTT -> LIVE | device=%s | age=%.2fs",
+            device_id,
+            age,
         )
 
-        maybe_alert(sample)
+        # Ghi database riêng, không chặn MQTT.
+        queue_telemetry(sample, received_at)
 
-        broadcast_latest(
-            sample.device_id,
-            {
-                "id": inserted["id"],
-                "received_at": utcnow(),
-                "payload": sample.model_dump(mode="json"),
-            },
-        )
-
-    except ValidationError as error:
-        details = [
-            {
-                "field": ".".join(
-                    str(part) for part in item["loc"]
-                ),
-                "type": item["type"],
-                "message": item["msg"],
-            }
-            for item in error.errors(
-                include_input=False,
-                include_url=False,
-            )
-        ]
-
+    except (ValidationError, ValueError, UnicodeError) as error:
         log.warning(
-            "Dữ liệu không đúng định dạng: %s",
-            details,
-        )
-
-    except UnicodeError:
-        log.warning("Bản tin không phải chuỗi UTF-8 hợp lệ")
-
-    except json.JSONDecodeError:
-        log.warning("Bản tin không phải JSON hợp lệ")
-
-    except ValueError as error:
-        log.warning("Bỏ qua dữ liệu: %s", error)
-
-    except psycopg2.Error as error:
-        log_database_error(
-            "Không lưu được bản tin vào database",
-            error,
+            "Bỏ qua bản tin không hợp lệ | loại=%s",
+            type(error).__name__,
         )
 
     except Exception as error:
         log.error(
-            "Lỗi xử lý bản tin MQTT | loại=%s",
+            "Lỗi xử lý MQTT | loại=%s",
             type(error).__name__,
         )
 
@@ -911,28 +977,38 @@ def mqtt_watchdog():
 async def lifespan(app):
     stopping.clear()
     mqtt_ready.clear()
+    io_stopping.clear()
 
-    log.info(
-        "File backend: %s",
-        Path(__file__).resolve(),
-    )
+    with live_lock:
+        live_rows.clear()
+        seen_samples.clear()
 
-    log.info(
-        "BACKEND | version=%s | host=%s | port=%s "
-        "| prefix=%s | device=%s | ai=ESP32 Week 2",
-        APP_VERSION,
-        MQTT_HOST,
-        MQTT_PORT,
-        PREFIX,
-        DEVICE_ID,
-    )
+    sse_subscribers.clear()
 
-    init_db()
+    await asyncio.to_thread(init_db)
 
     app.state.loop = asyncio.get_running_loop()
 
     executor = ThreadPoolExecutor(max_workers=1)
     app.state.alert_executor = executor
+
+    workers = [
+        threading.Thread(
+            target=telemetry_writer,
+            name="telemetry-db",
+            daemon=True,
+        ),
+        threading.Thread(
+            target=ack_writer,
+            name="ack-db",
+            daemon=True,
+        ),
+    ]
+
+    for worker in workers:
+        worker.start()
+
+    watchdog = None
     loop_started = False
 
     try:
@@ -945,17 +1021,16 @@ async def lifespan(app):
         result = mqtt_client.loop_start()
 
         if result != mqtt.MQTT_ERR_SUCCESS:
-            raise RuntimeError(
-                f"Không khởi động được MQTT loop: {result}"
-            )
+            raise RuntimeError("Không khởi động được MQTT")
 
         loop_started = True
 
-        threading.Thread(
+        watchdog = threading.Thread(
             target=mqtt_watchdog,
             name="mqtt-watchdog",
             daemon=True,
-        ).start()
+        )
+        watchdog.start()
 
         yield
 
@@ -965,12 +1040,22 @@ async def lifespan(app):
 
         if loop_started:
             mqtt_client.disconnect()
-            mqtt_client.loop_stop()
+            await asyncio.to_thread(mqtt_client.loop_stop)
 
-        executor.shutdown(
+        io_stopping.set()
+
+        for worker in workers:
+            await asyncio.to_thread(worker.join)
+
+        if watchdog is not None:
+            await asyncio.to_thread(watchdog.join)
+
+        await asyncio.to_thread(
+            executor.shutdown,
             wait=True,
-            cancel_futures=True,
         )
+
+        app.state.loop = None
 
 
 app = FastAPI(
@@ -1022,18 +1107,16 @@ def authorize(
 
 
 def latest_row(device_id):
-    return db(
-        """
-        SELECT id, received_at, payload
-        FROM telemetry_v2
-        WHERE device_id = %s
-          AND payload->'simulated' = 'false'::jsonb
-        ORDER BY received_at DESC, id DESC
-        LIMIT 1
-        """,
-        (device_id,),
-        fetch="one",
-    )
+    with live_lock:
+        row = live_rows.get(device_id)
+
+        if row is None:
+            return None
+
+        return {
+            **row,
+            "payload": dict(row["payload"]),
+        }
 
 
 def serialize(row):
@@ -1212,37 +1295,52 @@ async def telemetry_stream(
         pattern=r"^[A-Za-z0-9_-]+$",
     ),
 ):
-    """Server-Sent Events: web nhận bản tin ngay khi ESP32 gửi, không chờ polling."""
-    queue = asyncio.Queue(maxsize=50)
-    sse_subscribers.add(queue)
-
     async def generate():
-        try:
-            yield "retry: 2000\n\n"
+        event = asyncio.Event()
 
+        group = sse_subscribers.setdefault(
+            device_id,
+            set(),
+        )
+        group.add(event)
+
+        try:
             while True:
+                event.clear()
+
                 if await request.is_disconnected():
                     break
 
+                # Chỉ đọc bộ nhớ; không truy vấn database.
+                message = json.dumps(
+                    latest_response(device_id),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+
+                # Tương thích source.onmessage trong App.jsx.
+                yield f"retry: 2000\ndata: {message}\n\n"
+
                 try:
-                    target, message = await asyncio.wait_for(
-                        queue.get(),
-                        timeout=15,
+                    await asyncio.wait_for(
+                        event.wait(),
+                        timeout=5,
                     )
                 except asyncio.TimeoutError:
-                    yield ": keepalive\n\n"
-                    continue
+                    # Cập nhật tuổi dữ liệu kể cả khi kit ngừng gửi.
+                    pass
 
-                if target == device_id:
-                    yield f"data: {message}\n\n"
         finally:
-            sse_subscribers.discard(queue)
+            group.discard(event)
+
+            if not group:
+                sse_subscribers.pop(device_id, None)
 
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
         },
     )
@@ -1387,7 +1485,6 @@ def dispatch(device_id, kind, values):
 @app.post(
     "/api/control/pump",
     status_code=202,
-    dependencies=[Depends(authorize)],
 )
 def control_pump(command: PumpRequest):
     return dispatch(
@@ -1403,7 +1500,6 @@ def control_pump(command: PumpRequest):
 @app.post(
     "/api/control/mode",
     status_code=202,
-    dependencies=[Depends(authorize)],
 )
 def control_mode(command: ModeRequest):
     return dispatch(
