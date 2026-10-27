@@ -1,0 +1,21 @@
+# Node.js
+node_modules/
+dist/
+build/
+.env
+
+# Python / AI
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# PlatformIO / Firmware
+.pio/
+.vscode/
+
+# KiCad
+*-backups/
+*.bck
+*.dcm
+fp-info-cache

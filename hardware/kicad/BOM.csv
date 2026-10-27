@@ -1,0 +1,8 @@
+Reference,Quantity,Value,Footprint,Description,Designer
+U1,1,ESP32-WROOM-32,Module:ESP32-WROOM-32,Wi-Fi + BT MCU Module,Nguyen Phi Lanh
+U2,1,DHT22,Sensor:DHT22_PinHeader,Digital Temperature and Humidity Sensor,Nguyen Phi Lanh
+U3,1,MQ-135,Sensor:MQ-135_Socket,Air Quality / Gas Sensor,Nguyen Phi Lanh
+U4,1,AMS1117-3.3,Package_TO_SOT_SMD:SOT-223-3_TabPin2,3.3V 1A LDO Voltage Regulator,Nguyen Phi Lanh
+K1,1,SRD-05VDC-SL-C,Relay_THT:Relay_SPDT_SANYOU_SRD_Series_Form_C,5V Relay Module Control,Nguyen Phi Lanh
+Q1,1,2N2222,Package_TO_SOT_THT:TO-92_Inline,NPN Transistor for Relay Driver,Nguyen Phi Lanh
+D1,1,1N4007,Diode_SMD:D_SMA,Flyback Diode,Nguyen Phi Lanh

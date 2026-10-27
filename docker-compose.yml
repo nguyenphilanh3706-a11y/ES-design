@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  mqtt-broker:
+    image: eclipse-mosquitto:2
+    container_name: iot_mqtt_broker
+    ports:
+      - "1883:1883"
+
+  backend:
+    build: ./backend
+    container_name: iot_backend
+    ports:
+      - "5000:5000"
+    environment:
+      - PORT=5000
+      - MQTT_URL=mqtt://mqtt-broker:1883
+    depends_on:
+      - mqtt-broker
+
+  ai-engine:
+    image: python:3.11-slim
+    container_name: iot_ai_engine
+    working_dir: /app
+    volumes:
+      - ./ai_engine:/app
+    command: sh -c "pip install -r requirements.txt && python src/inference_service.py"
+    depends_on:
+      - mqtt-broker

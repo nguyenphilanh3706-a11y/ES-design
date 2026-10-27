@@ -1,0 +1,15 @@
+(kicad_pcb (version 20221018) (generator pcbnew)
+  (general (thickness 1.6))
+  (paper "A4")
+  (title_block
+    (title "Smart IoT & AI Edge Node PCB Layout")
+    (date "2026-10-27")
+    (rev "v1.0")
+    (company "Designed by Nguyen Phi Lanh")
+  )
+  (layers
+    (0 "F.Cu" signal)
+    (31 "B.Cu" signal)
+    (44 "Edge.Cuts" user)
+  )
+)

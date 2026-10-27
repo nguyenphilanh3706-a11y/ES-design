@@ -1,0 +1,14 @@
+{
+  "board": {
+    "design_settings": {
+      "defaults": {
+        "board_outline_line_width": 0.1,
+        "copper_line_width": 0.25
+      }
+    }
+  },
+  "meta": {
+    "filename": "smart_iot_node.kicad_pro",
+    "version": 1
+  }
+}
