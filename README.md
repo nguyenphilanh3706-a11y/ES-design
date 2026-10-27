@@ -1,6 +1,7 @@
 # Hệ Thống IoT & AI Thông Minh (Smart IoT & AI System)
 
 Dự án tích hợp Phần cứng (ESP32), Firmware, Trí tuệ nhân tạo (Edge/Server AI), Backend (Node.js/FastAPI) và Frontend Web (React.js) theo kiến trúc thời gian thực.
+   📺 Kênh YouTube: [Anh Quốc](https://www.youtube.com/@AnhQu%E1%BB%91c-h6p)
 
 ## Cấu trúc thư mục
 ```
